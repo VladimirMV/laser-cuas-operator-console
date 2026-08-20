@@ -19,11 +19,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
-      - run: npm install
-      - run: npm run build
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Force public registry (lockfile may contain internal proxy URLs from sandbox)
+      - name: Install dependencies
+        run: |
+          npm config set registry https://registry.npmjs.org
+          # Drop lock so npm resolves from public registry
+          rm -f package-lock.json
+          npm install --no-fund --no-audit
+
+      - name: Build
+        run: npm run build
+
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist

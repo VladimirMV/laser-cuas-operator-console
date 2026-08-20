@@ -1,36 +1,23 @@
 # Laser C-UAS Operator Console
 
-Private HMI demo for the laser directed-energy C-UAS station  
-**Common Laser Technologies** / partner: ISP NASU.
+**Private** HMI demo — Common Laser Technologies / ISP NASU.
 
-## Features
-- Three camera channels (LONG / WIDE / IR) with live HLS demo streams
-- Stable multi-player switching (no restart on channel change)
-- PIP previews of secondary cameras
-- Modes: MANUAL / SEMI / AUTO
-- Safety ladder: SAFE → ARM → FIRE
-- Situation map, effector ladder, event log, BITE, calibration wizard
-- UA / EN UI
+https://github.com/VladimirMV/laser-cuas-operator-console
 
-## Run locally
+## Local run
 ```bash
 npm install
 npm run dev
 ```
-Open http://localhost:5173
+http://localhost:5173
 
-## Build
-```bash
-npm run build
-npm run preview
-```
+## Web demo (GitHub Pages)
+After Actions succeeds:
+**https://vladimirmv.github.io/laser-cuas-operator-console/**
 
-## Demo streams
-| Channel | Source |
-|---------|--------|
-| LONG | ireplay.tv continuous |
-| WIDE | Mux HLS demo |
-| IR | Apple bipbop + thermal CSS |
+Settings → Pages → Source: **GitHub Actions**.
+
+Private repo: Pages is visible to collaborators. For external reviewers use Cloudflare Pages or add them as collaborators.
 
 ## Version
 v1.4.8
