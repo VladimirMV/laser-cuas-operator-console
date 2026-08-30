@@ -27,7 +27,7 @@ const STEP_KEYS: { title: TranslationKey; desc: TranslationKey }[] = [
 export function CalibrationWizard() {
   const {
     calStep, calMeasurements, nextCalStep, prevCalStep,
-    addCalMeasurement, finishCalibration, cancelCalibration,
+    addCalMeasurement, updateCalMeasurement, finishCalibration, cancelCalibration,
   } = useHmiStore()
   const { t } = useT()
 
@@ -36,7 +36,7 @@ export function CalibrationWizard() {
   const addNextRange = () => {
     const used = new Set(calMeasurements.map((m) => m.range))
     const next = RANGE_TABLE.find((r) => !used.has(r))
-    if (next) addCalMeasurement(syntheticMeasurement(next))
+    if (next) addCalMeasurement({ range: next, du: 0, dv: 0 })
   }
 
   return (
@@ -91,8 +91,28 @@ export function CalibrationWizard() {
                     {calMeasurements.map((m) => (
                       <tr key={m.range} className="border-b border-[#21262D]">
                         <td className="py-1 px-2">{m.range}</td>
-                        <td className="py-1 px-2 text-right">{m.du.toFixed(3)}</td>
-                        <td className="py-1 px-2 text-right">{m.dv.toFixed(3)}</td>
+                        <td className="py-0.5 px-2 text-right">
+                          <input
+                            type="number"
+                            step="0.001"
+                            value={Number.isFinite(m.du) ? m.du : 0}
+                            onChange={(e) =>
+                              updateCalMeasurement(m.range, { du: Number(e.target.value) })
+                            }
+                            className="w-24 bg-[#0D1117] border border-[#30363D] rounded px-1 py-0.5 text-right text-[#E6EDF3] outline-none focus:border-[#58A6FF]"
+                          />
+                        </td>
+                        <td className="py-0.5 px-2 text-right">
+                          <input
+                            type="number"
+                            step="0.001"
+                            value={Number.isFinite(m.dv) ? m.dv : 0}
+                            onChange={(e) =>
+                              updateCalMeasurement(m.range, { dv: Number(e.target.value) })
+                            }
+                            className="w-24 bg-[#0D1117] border border-[#30363D] rounded px-1 py-0.5 text-right text-[#E6EDF3] outline-none focus:border-[#58A6FF]"
+                          />
+                        </td>
                       </tr>
                     ))}
                     {calMeasurements.length === 0 && (

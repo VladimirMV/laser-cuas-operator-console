@@ -3,6 +3,7 @@ import { useHmiStore } from '../store/useHmiStore'
 import { useT } from '../i18n/useT'
 import { cn } from '../lib/utils'
 import type { LayoutProfile, LaserWavelength } from '../types/hmi'
+import { collectHealthIssues, foldSystemStatus } from '../lib/systemHealth'
 
 export function MaintenanceScreen() {
   const {
@@ -10,7 +11,9 @@ export function MaintenanceScreen() {
     extras,
     parallax,
     calibrationStatus,
-    systemStatus,
+    turretLink,
+    platform,
+    biteItems,
     laserStatus,
     layoutProfile,
     setLayoutProfile,
@@ -24,9 +27,18 @@ export function MaintenanceScreen() {
     resetLaserUserCounter,
     refreshLaserTelemetry,
   } = useHmiStore()
-  const { t } = useT()
+  const { t, lang } = useT()
 
   const canCtrl = laserStatus === 'SAFE'
+  const systemStatus = foldSystemStatus(
+    collectHealthIssues({
+      turretLink,
+      platform,
+      laserTelemetry: lt,
+      calibrationStatus,
+      biteFault: biteItems.some((i) => i.status === 'DEGRADED' || i.status === 'FAULT'),
+    })
+  )
 
   const rows = [
     { label: t('tempLaser'), value: `${lt.tempHeadC.toFixed(1)} °C`, icon: Thermometer },
@@ -36,7 +48,7 @@ export function MaintenanceScreen() {
     { label: t('shotLife'), value: lt.shotLife.toLocaleString(), icon: Zap },
     { label: t('lampLife'), value: `${lt.lampLifePct.toFixed(1)}%`, icon: Zap },
     { label: t('calibStatus'), value: calibrationStatus === 'VALID' ? t('valid') : t('check'), icon: RefreshCw },
-    { label: 'Parallax a / c', value: `${parallax.a.toFixed(3)} / ${parallax.c.toFixed(0)}`, icon: HardDrive },
+    { label: t('calFormula').split('·')[0].trim() || 'Parallax', value: `${parallax.a.toFixed(3)} / ${parallax.c.toFixed(0)}`, icon: HardDrive },
     { label: 'R₀', value: `${parallax.r0} m`, icon: HardDrive },
     { label: t('sys'), value: systemStatus, icon: HardDrive },
     { label: t('laser'), value: laserStatus, icon: Zap },
@@ -44,9 +56,9 @@ export function MaintenanceScreen() {
   ]
 
   const profiles: { id: LayoutProfile; label: string }[] = [
-    { id: 'laptop', label: 'LAPTOP 16:9' },
-    { id: 'soc', label: 'SOC / DESK' },
-    { id: 'vehicle', label: 'VEHICLE' },
+    { id: 'laptop' as const, label: lang === 'ua' ? 'НОУТБУК 16:9' : 'LAPTOP 16:9' },
+    { id: 'soc' as const, label: lang === 'ua' ? 'SOC / СТІЛ' : 'SOC / DESK' },
+    { id: 'vehicle' as const, label: lang === 'ua' ? 'БОРТ / КШМ' : 'VEHICLE' },
   ]
 
   const wavelengths: LaserWavelength[] = [1064, 532, 355, 266]

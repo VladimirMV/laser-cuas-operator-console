@@ -1,26 +1,17 @@
-import { useMemo } from 'react'
 import { MapPin, Radar, Crosshair, Navigation } from 'lucide-react'
 import { useHmiStore } from '../store/useHmiStore'
 import { useT } from '../i18n/useT'
 import { formatCoord } from '../lib/geo'
 import { cn } from '../lib/utils'
+import { OsmBasemap } from './OsmBasemap'
 
 /**
- * Full-screen tactical map on main display.
- * Base layer: Google Maps embed centered on platform GPS.
- * Overlay: radar/C2 cues, target, station marker legend + polar bearings.
+ * Full-screen tactical map.
+ * Base layer: Carto Dark Matter (OSM) — free, no API key. OSM embed fallback.
  */
 export function MainMapView() {
-  const { platform, target, cues, turret, slewToCue, lang } = useHmiStore()
+  const { platform, target, cues, turret, slewToCue } = useHmiStore()
   const { t } = useT()
-
-  const hl = lang === 'ua' ? 'uk' : 'en'
-  const zoom = 14
-  // Google Maps embed (no API key required for basic q= embed)
-  const embedUrl = useMemo(() => {
-    const q = `${platform.lat},${platform.lon}`
-    return `https://maps.google.com/maps?q=${encodeURIComponent(q)}&z=${zoom}&hl=${hl}&t=m&output=embed`
-  }, [platform.lat, platform.lon, hl])
 
   const activeCues = cues.filter((c) => c.status !== 'DROPPED')
   const radarCues = activeCues.filter((c) => c.source === 'RADAR' || c.source === 'C2')
@@ -40,15 +31,7 @@ export function MainMapView() {
 
   return (
     <div className="relative flex-1 bg-[#0A0E14] overflow-hidden border border-[#30363D] min-h-0">
-      {/* Google Maps */}
-      <iframe
-        title="Google Maps"
-        src={embedUrl}
-        className="absolute inset-0 w-full h-full border-0"
-        loading="lazy"
-        referrerPolicy="no-referrer-when-downgrade"
-        allowFullScreen
-      />
+      <OsmBasemap lat={platform.lat} lon={platform.lon} zoom={15} />
 
       {/* Dim edge for readability of overlays */}
       <div className="absolute inset-0 pointer-events-none bg-gradient-to-r from-black/50 via-transparent to-black/40" />
@@ -56,7 +39,7 @@ export function MainMapView() {
       {/* Top badge */}
       <div className="absolute top-3 left-3 z-20 flex items-center gap-2 flex-wrap pointer-events-none">
         <div className="px-2.5 py-1 rounded bg-black/70 border border-[#30363D] font-mono text-xs tracking-widest text-[#3FB950]">
-          {t('map')} · Google Maps
+          {t('map')}
         </div>
         <div className="px-2 py-1 rounded bg-black/70 border border-[#30363D] font-mono text-[10px] text-[#E6EDF3]">
           {formatCoord(platform.lat, true)} {formatCoord(platform.lon, false)}

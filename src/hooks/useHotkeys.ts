@@ -1,10 +1,8 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useCallback } from 'react'
 import { useHmiStore } from '../store/useHmiStore'
 
 /** Global keyboard shortcuts for combat HMI. Disabled while typing in inputs. */
 export function useHotkeys() {
-  const [showHelp, setShowHelp] = useState(false)
-
   const {
     laserStatus,
     screen,
@@ -35,6 +33,16 @@ export function useHotkeys() {
     setShowCameraSettings,
     showCameraSettings,
     slewTurret,
+    setShowHelp,
+    toggleHelp,
+    showHelp,
+    showServicePin,
+    showServiceMenu,
+    closeServiceUi,
+    bumpZoom,
+    toggleFullscreen,
+    exitFullscreen,
+    isFullscreen,
   } = useHmiStore()
 
   const closeOverlays = useCallback(() => {
@@ -44,7 +52,7 @@ export function useHotkeys() {
     else if (screen === 'SESSIONS') closeSessions()
     if (showCameraSettings) setShowCameraSettings(false)
     setShowHelp(false)
-  }, [screen, cancelCalibration, closeBite, closeMaintenance, closeSessions, showCameraSettings, setShowCameraSettings])
+  }, [screen, cancelCalibration, closeBite, closeMaintenance, closeSessions, showCameraSettings, setShowCameraSettings, setShowHelp])
 
   useEffect(() => {
     const isTyping = (e: KeyboardEvent) => {
@@ -62,12 +70,17 @@ export function useHotkeys() {
 
       if (lower === 'h' && !e.ctrlKey && !e.metaKey) {
         e.preventDefault()
-        setShowHelp((v) => !v)
+        toggleHelp()
         return
       }
 
       if (key === 'Escape') {
         e.preventDefault()
+        if (showHelp) { setShowHelp(false); return }
+        if (showServicePin || showServiceMenu) { closeServiceUi(); return }
+        if (showCameraSettings) { setShowCameraSettings(false); return }
+        if (screen !== 'COMBAT') { closeOverlays(); return }
+        if (isFullscreen || document.fullscreenElement) { exitFullscreen(); return }
         safe()
         setArmConfirm(false)
         closeOverlays()
@@ -120,8 +133,9 @@ export function useHotkeys() {
 
       if (lower === 'g') { e.preventDefault(); toggleLang(); return }
 
-      if (key === '+' || key === '=') { e.preventDefault(); setZoom(Math.min(20, zoom + 0.5)); return }
-      if (key === '-' || key === '_') { e.preventDefault(); setZoom(Math.max(1, zoom - 0.5)); return }
+      if (key === '+' || key === '=') { e.preventDefault(); bumpZoom(0.2); return }
+      if (key === '-' || key === '_') { e.preventDefault(); bumpZoom(-0.2); return }
+      if (lower === 'f') { e.preventDefault(); toggleFullscreen(); return }
     }
 
     const onKeyUp = (e: KeyboardEvent) => {
@@ -143,9 +157,9 @@ export function useHotkeys() {
     setMode, setActiveCamera, setZoom, zoom, openCalibration, openBite,
     openMaintenance, loseTrack, reacquire, toggleLang, armConfirm,
     setArmConfirm, closeOverlays, toggleRecording, openSessions, setShowCameraSettings, slewTurret,
+    toggleHelp, setShowHelp, showHelp, showServicePin, showServiceMenu, closeServiceUi,
+    bumpZoom, toggleFullscreen, exitFullscreen, isFullscreen,
   ])
-
-  return { showHelp, setShowHelp }
 }
 
 export const HOTKEY_ROWS = [
@@ -163,6 +177,7 @@ export const HOTKEY_ROWS = [
   { keys: 'T', actionKey: 'hkTrack' },
   { keys: 'G', actionKey: 'hkLang' },
   { keys: '+ / -', actionKey: 'hkZoom' },
+  { keys: 'F', actionKey: 'hkFullscreen' },
   { keys: 'H', actionKey: 'hkHelp' },
   { keys: 'R', actionKey: 'hkRec' },
   { keys: 'V', actionKey: 'hkSessions' },

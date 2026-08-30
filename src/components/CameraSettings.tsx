@@ -1,4 +1,4 @@
-import { useHmiStore } from '../store/useHmiStore'
+import { useHmiStore, CAMERA_ZOOM } from '../store/useHmiStore'
 import { useT } from '../i18n/useT'
 import type { CameraChannel } from '../types/hmi'
 
@@ -61,6 +61,22 @@ export function CameraSettings({ onClose }: { onClose: () => void }) {
                     className="w-full accent-[#58A6FF]"
                   />
                 </label>
+                {CAMERA_ZOOM[ch].hasZoom ? (
+                  <label className="block text-[10px] text-[#8B949E] font-mono">
+                    {t('zoom')}: {(adj.zoom ?? 1).toFixed(1)}×
+                    <input
+                      type="range"
+                      min={CAMERA_ZOOM[ch].min}
+                      max={CAMERA_ZOOM[ch].max}
+                      step={CAMERA_ZOOM[ch].step}
+                      value={adj.zoom ?? 1}
+                      onChange={(e) => setCameraAdjust(ch, 'zoom', Number(e.target.value))}
+                      className="w-full accent-[#D29922]"
+                    />
+                  </label>
+                ) : (
+                  <div className="text-[10px] font-mono text-[#6E7681]">{t('noZoom')}</div>
+                )}
               </div>
             )
           })}

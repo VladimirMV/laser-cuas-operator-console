@@ -1,11 +1,13 @@
 import type { CameraChannel } from '../types/hmi'
+import { panoptesConfig } from './panoptesConfig'
+import {
+  getPanoptesStreamFallback,
+  getPanoptesStreamUrl,
+} from '../adapters/panoptes'
 
 /**
  * Demo HLS streams (public, CORS-open, no tokens).
- *
- * LONG — ireplay continuous 24/7 (live window, never restarts to t=0)
- * WIDE — Mux Big Buck Bunny multivariant (reliable; loops)
- * IR   — Apple bipbop advanced (reliable test pattern; loops) + thermal CSS
+ * When VITE_USE_REAL_TURRET=true → Panoptes MJPEG via resolveChannelStream.
  */
 export function isHlsUrl(url: string): boolean {
   return /\.m3u8(\?|$)/i.test(url)
@@ -41,3 +43,32 @@ export const MP4_FALLBACK =
 
 export const MP4_FALLBACK_ALT =
   'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4'
+
+/** Resolve display URL for a channel (real Panoptes or demo HLS) */
+export function resolveChannelStream(channel: CameraChannel): {
+  url: string | null
+  fallback: string | null
+  kind: 'mjpeg' | 'hls' | 'none'
+  label: string
+} {
+  if (panoptesConfig.useRealTurret) {
+    const url = getPanoptesStreamUrl(channel)
+    const fallback = getPanoptesStreamFallback(channel)
+    if (!url) {
+      return { url: null, fallback: null, kind: 'none', label: 'NOT FITTED' }
+    }
+    return {
+      url,
+      fallback,
+      kind: 'mjpeg',
+      label: channel === 'LONG' ? 'MJPEG · DAY 2K' : 'MJPEG · THERMAL',
+    }
+  }
+  const url = CHANNEL_PRIMARY[channel]
+  return {
+    url,
+    fallback: null,
+    kind: 'hls',
+    label: `HLS · ${channel}`,
+  }
+}

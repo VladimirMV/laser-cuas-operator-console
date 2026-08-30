@@ -17,8 +17,9 @@ export function SafetyStrip() {
 
   if (messages.length === 0) {
     return (
-      <div className="h-8 flex items-center px-4 bg-[#161B22] border-t border-[#30363D] text-[11px] font-mono text-[#3FB950] shrink-0">
-        {t('systemReady')}
+      <div className="h-8 flex items-center justify-between px-4 bg-[#161B22] border-t border-[#30363D] text-[11px] font-mono shrink-0">
+        <span className="text-[#3FB950]">{t('systemReady')}</span>
+        <span className="text-[#6E7681] pointer-events-none">HMI 1.8.0</span>
       </div>
     )
   }
@@ -38,7 +39,8 @@ export function SafetyStrip() {
       )}
     >
       <AlertTriangle size={14} />
-      {messages.join('  ·  ')}
+      <span className="flex-1">{messages.join('  ·  ')}</span>
+      <span className="text-[#6E7681] font-normal pointer-events-none">HMI 1.8.0</span>
     </div>
   )
 }

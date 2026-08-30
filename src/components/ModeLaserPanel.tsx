@@ -94,7 +94,7 @@ export function ModeLaserPanel() {
               )}
             >
               <Crosshair size={15} />
-              {t('arm')}
+              {t('ready')}
             </button>
           ) : (
             <button

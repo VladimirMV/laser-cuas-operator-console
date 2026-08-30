@@ -1,0 +1,28 @@
+{
+  "host": "127.0.0.1",
+  "port": 8787,
+  "mediaRoot": "./media",
+  "corsOrigin": "*",
+  "defaultCodec": "h265",
+  "segmentDurationSec": 60,
+  "bitratesKbps": {
+    "LONG": 6000,
+    "WIDE": 3000,
+    "IR": 2000
+  },
+  "channels": {
+    "LONG": {
+      "url": "",
+      "comment": "Set RTSP/SRT/HTTP URL, e.g. rtsp://192.168.1.10:554/stream1. Empty = ffmpeg testsrc (lab only)."
+    },
+    "WIDE": {
+      "url": ""
+    },
+    "IR": {
+      "url": ""
+    }
+  },
+  "ffmpegPath": "ffmpeg",
+  "preferHw": false,
+  "hwEncoder": "hevc_nvenc"
+}

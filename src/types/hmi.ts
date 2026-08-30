@@ -25,6 +25,8 @@ export type AutomationState =
   | 'SEARCHING'
 
 export type LayoutProfile = 'laptop' | 'soc' | 'vehicle'
+export type CombatChrome = 'hud' | 'stack'
+export type RightDockTab = 'CAM' | 'WEAPON' | 'C2' | 'SYS'
 
 export type EventType =
   | 'CUE_RECEIVED'
@@ -44,7 +46,7 @@ export type EventType =
   | 'REC_STOP'
   | 'EFFECTOR'
 
-export type EventSource = 'UI' | 'HOTKEY' | 'EXTERNAL' | 'SYSTEM'
+export type EventSource = 'UI' | 'HOTKEY' | 'GAMEPAD' | 'EXTERNAL' | 'SYSTEM'
 
 export interface ParallaxCoeffs {
   a: number
@@ -90,6 +92,7 @@ export interface TurretState {
 export interface CameraAdjust {
   brightness: number
   contrast: number
+  zoom: number
 }
 
 export type CameraAdjustMap = Record<CameraChannel, CameraAdjust>

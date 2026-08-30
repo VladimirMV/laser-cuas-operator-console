@@ -1,20 +1,18 @@
-import { CHANNEL_PRIMARY } from '../lib/streams'
-import { HlsPlayer } from './HlsPlayer'
+import { resolveChannelStream } from '../lib/streams'
+import { StreamPlayer } from './StreamPlayer'
 import type { CameraChannel } from '../types/hmi'
 
+/** PIP preview — same stream source as main (Panoptes MJPEG or demo HLS) */
 export function PipVideo({ channel }: { channel: CameraChannel }) {
-  const url = CHANNEL_PRIMARY[channel]
-  const isIr = channel === 'IR'
+  const meta = resolveChannelStream(channel)
 
   return (
-    <HlsPlayer
-      url={url}
+    <StreamPlayer
+      url={meta.url}
+      fallbackUrl={meta.fallback}
       className="absolute inset-0 w-full h-full object-cover"
-      style={
-        isIr
-          ? { filter: 'grayscale(0.4) sepia(0.5) hue-rotate(-15deg) contrast(1.15)' }
-          : undefined
-      }
+      notFittedLabel={channel === 'WIDE' ? 'WIDE' : 'NO STREAM'}
+      thermalStyle={channel === 'IR'}
     />
   )
 }

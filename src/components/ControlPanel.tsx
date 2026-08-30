@@ -13,7 +13,7 @@ export function ControlPanel() {
 
   return (
     <div className="bg-[#161B22] border border-[#30363D] rounded p-2.5 space-y-1.5">
-      <div className="text-[10px] text-[#8B949E] font-mono tracking-wider mb-0.5">SERVICE</div>
+      <div className="text-[10px] text-[#8B949E] font-mono tracking-wider mb-0.5">{t('service')}</div>
 
       <button
         onClick={target?.trackState === 'TRACKING' ? loseTrack : reacquire}

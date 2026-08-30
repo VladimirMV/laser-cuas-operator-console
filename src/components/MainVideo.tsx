@@ -1,10 +1,11 @@
-import { useHmiStore } from '../store/useHmiStore'
+import { useHmiStore, CAMERA_ZOOM } from '../store/useHmiStore'
 import { useT } from '../i18n/useT'
 import { computeParallaxOffset, cn } from '../lib/utils'
-import { CHANNEL_PRIMARY } from '../lib/streams'
+import { resolveChannelStream } from '../lib/streams'
 import { MainMapView } from './MainMapView'
-import { HlsPlayer } from './HlsPlayer'
-import { Settings2, Circle } from 'lucide-react'
+import { StreamPlayer } from './StreamPlayer'
+import { AiOverlay } from './AiOverlay'
+import { Circle, SlidersHorizontal } from 'lucide-react'
 import { motion, AnimatePresence } from 'framer-motion'
 import type { CameraChannel } from '../types/hmi'
 
@@ -13,14 +14,15 @@ const ALL_CAMS: CameraChannel[] = ['LONG', 'WIDE', 'IR']
 export function MainVideo() {
   const target = useHmiStore((s) => s.target)
   const laserStatus = useHmiStore((s) => s.laserStatus)
-  const mode = useHmiStore((s) => s.mode)
-  const zoom = useHmiStore((s) => s.zoom)
   const activeCamera = useHmiStore((s) => s.activeCamera)
   const parallax = useHmiStore((s) => s.parallax)
   const cameraAdjust = useHmiStore((s) => s.cameraAdjust)
   const setShowCameraSettings = useHmiStore((s) => s.setShowCameraSettings)
   const recording = useHmiStore((s) => s.recording)
   const turret = useHmiStore((s) => s.turret)
+  const aiEnabled = useHmiStore((s) => s.aiEnabled)
+  const aiLink = useHmiStore((s) => s.aiLink)
+  const toggleAi = useHmiStore((s) => s.toggleAi)
   const { t } = useT()
 
   const isMap = activeCamera === 'MAP'
@@ -47,7 +49,13 @@ export function MainVideo() {
             : '#F85149'
 
   const camLabel =
-    activeCamera === 'LONG' ? t('long') : activeCamera === 'WIDE' ? t('wide') : t('ir')
+    activeCamera === 'LONG'
+      ? t('long')
+      : activeCamera === 'WIDE'
+        ? t('wide')
+        : activeCamera === 'IR'
+          ? t('ir')
+          : t('map')
 
   const fov =
     activeCamera === 'LONG' ? '1.8°' : activeCamera === 'WIDE' ? '28°' : '12°'
@@ -60,8 +68,7 @@ export function MainVideo() {
     return `brightness(${a.brightness / 100}) contrast(${a.contrast / 100})`
   }
 
-  const streamLabel =
-    camChannel === 'WIDE' ? 'HLS · WIDE' : camChannel === 'IR' ? 'HLS · IR' : 'HLS · LONG'
+  const streamMeta = resolveChannelStream(camChannel)
 
   return (
     <div className="relative flex-1 bg-[#0A0E14] overflow-hidden border border-[#30363D] min-h-0">
@@ -76,43 +83,62 @@ export function MainVideo() {
               filter: filterFor(ch),
             }}
           >
-            <HlsPlayer
-              url={CHANNEL_PRIMARY[ch]}
-              className="absolute inset-0 w-full h-full object-cover"
-              loop
+            <StreamPlayer
+              url={resolveChannelStream(ch).url}
+              fallbackUrl={resolveChannelStream(ch).fallback}
+              notFittedLabel={ch === 'WIDE' ? 'WIDE — NOT FITTED' : 'NO STREAM'}
+              thermalStyle={ch === 'IR'}
+              zoom={cameraAdjust[ch].zoom}
             />
           </div>
         ))}
       </div>
 
+      {camChannel === 'LONG' && <AiOverlay />}
+
       <div className="absolute top-3 left-3 z-20 flex items-center gap-2 flex-wrap">
         <div className="px-2.5 py-1 rounded bg-black/60 border border-[#30363D] font-mono text-xs tracking-widest text-[#8B949E]">
-          {camLabel} · {zoom.toFixed(1)}× · {mode}
-        </div>
-        <div className="px-2 py-1 rounded bg-black/60 border border-[#30363D] font-mono text-[10px] text-[#58A6FF]">
-          {streamLabel}
+          {camLabel}
+          {CAMERA_ZOOM[camChannel].hasZoom
+            ? ` · ${(cameraAdjust[camChannel].zoom ?? 1).toFixed(1)}×`
+            : ''}
         </div>
         {recording && (
           <div className="flex items-center gap-1.5 px-2 py-1 rounded bg-[#F85149]/20 border border-[#F85149]/50 text-[#F85149] font-mono text-[10px] font-bold animate-pulse">
             <Circle size={8} fill="#F85149" /> {t('rec')}
           </div>
         )}
+        <button
+          type="button"
+          onClick={toggleAi}
+          className={
+            aiEnabled
+              ? 'px-2 py-1 rounded border border-[#00E5FF] bg-[#00E5FF]/15 text-[#00E5FF] font-mono text-[10px] font-bold'
+              : 'px-2 py-1 rounded border border-[#30363D] bg-black/60 text-[#8B949E] font-mono text-[10px] font-bold hover:border-[#00E5FF]/50'
+          }
+          title={t('aiOverlay')}
+        >
+          AI{aiEnabled ? (aiLink === 'OK' ? ' · ON' : ' · …') : ''}
+        </button>
       </div>
 
       <button
+        type="button"
         onClick={() => setShowCameraSettings(true)}
         className="absolute top-3 right-3 z-20 p-1.5 rounded border border-[#30363D] bg-black/60 text-[#8B949E] hover:text-[#E6EDF3] hover:border-[#8B949E]"
         title={t('camSettings')}
       >
-        <Settings2 size={14} />
+        <SlidersHorizontal size={14} />
       </button>
 
-      <div className="absolute bottom-3 left-3 z-20 font-mono text-[11px] text-[#8B949E] bg-black/50 px-2 py-1 rounded space-y-0.5 max-w-[90%]">
+      <div className="absolute bottom-3 left-3 z-20 font-mono text-[11px] text-[#E6EDF3] bg-black/80 backdrop-blur-sm px-2.5 py-1.5 rounded border border-black/60 shadow-[0_2px_8px_rgba(0,0,0,0.7)] space-y-0.5 max-w-[min(90%,22rem)] [text-shadow:0_1px_2px_rgba(0,0,0,0.9)]">
         <div>
           R {range ? `${(range / 1000).toFixed(2)} km` : '—'} · {t('fov')} {fov} · {t('turret')}{' '}
           {turret.az.toFixed(1)}°/{turret.el.toFixed(1)}°
         </div>
-        <div className="text-[9px] text-[#58A6FF]/80 truncate">{CHANNEL_PRIMARY[camChannel]}</div>
+        <div className="text-[9px] text-[#79C0FF] truncate">
+          {streamMeta.url ?? '—'}
+        </div>
         {target && laserStatus !== 'SAFE' && (
           <div className="text-[#FFA657]">
             Δ {offset.duMrad.toFixed(2)} / {offset.dvMrad.toFixed(2)} mrad
@@ -164,19 +190,27 @@ export function MainVideo() {
         )}
       </AnimatePresence>
 
-      {target && target.trackState !== 'SEARCH' && target.trackState !== 'LOST' && (
-        <div
-          className="absolute border-2 pointer-events-none z-10"
-          style={{
-            left: '42%',
-            top: '36%',
-            width: '16%',
-            height: '24%',
-            borderColor: trackColor,
-            opacity: isLost ? 0.55 : 1,
-          }}
-        />
-      )}
+      {target && target.trackState !== 'SEARCH' && target.trackState !== 'LOST' && (() => {
+        const box = Math.max(8, Math.min(28, 18000 / Math.max(range, 1)))
+        const boxH = box * 1.4
+        const cx = target.posX ?? 50
+        const cy = target.posY ?? 50
+        return (
+          <div
+            className="absolute pointer-events-none z-10"
+            style={{
+              left: `${cx - box / 2}%`,
+              top: `${cy - boxH / 2}%`,
+              width: `${box}%`,
+              height: `${boxH}%`,
+              borderWidth: 2,
+              borderStyle: target.trackState === 'COAST' ? 'dashed' : 'solid',
+              borderColor: trackColor,
+              opacity: isLost ? 0.55 : 1,
+            }}
+          />
+        )
+      })()}
 
       <AnimatePresence>
         {isLost && (
