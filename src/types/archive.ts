@@ -142,7 +142,7 @@ export const DEFAULT_RECORDING_PROFILE: RecordingProfile = {
   mode: 'COMBAT',
   channels: { LONG: true, WIDE: false, IR: true },
   codec: 'h265',
-  segmentDurationSec: 60,
+  segmentDurationSec: 15,
   bitrates: { LONG: 6000, WIDE: 3000, IR: 2000 },
   autoSnapshotOn: ['ARM', 'FIRE_START', 'FIRE_END', 'TRACK_LOST'],
   prerollSec: 15,

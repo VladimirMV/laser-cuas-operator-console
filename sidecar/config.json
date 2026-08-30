@@ -4,7 +4,10 @@
   "mediaRoot": "./media",
   "corsOrigin": "*",
   "defaultCodec": "h265",
-  "segmentDurationSec": 60,
+  "segmentDurationSec": 15,
+  "prerollSec": 15,
+  "ringSegmentSec": 6,
+  "ringWrap": 15,
   "bitratesKbps": {
     "LONG": 6000,
     "WIDE": 3000,
@@ -12,14 +15,17 @@
   },
   "channels": {
     "LONG": {
-      "url": "",
-      "comment": "Set RTSP/SRT/HTTP URL, e.g. rtsp://192.168.1.10:554/stream1. Empty = ffmpeg testsrc (lab only)."
+      "url": "testsrc",
+      "labUrl": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4",
+      "comment": "Set RTSP here for live turret. testsrc = lab pattern (real mp4). Or copy labUrl into url."
     },
     "WIDE": {
-      "url": ""
+      "url": "testsrc",
+      "labUrl": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4"
     },
     "IR": {
-      "url": ""
+      "url": "testsrc",
+      "labUrl": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerJoyrides.mp4"
     }
   },
   "ffmpegPath": "ffmpeg",

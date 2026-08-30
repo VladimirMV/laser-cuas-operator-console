@@ -37,6 +37,7 @@ export default function App() {
     recording,
     tickRecordingSegments,
     laserStatus,
+    pollSidecar,
   } = useHmiStore()
   useHotkeys()
   useGamepad()
@@ -79,8 +80,11 @@ export default function App() {
         caps.metaOnly ? 'MockMediaRecorder (meta)' : 'HttpMediaRecorder (side-car)',
         caps
       )
+      void useHmiStore.getState().pollSidecar()
     })
-  }, [])
+    const id = setInterval(() => void useHmiStore.getState().pollSidecar(), 4000)
+    return () => clearInterval(id)
+  }, [pollSidecar])
 
   const fastTel =
     laserStatus === 'FIRING' ||

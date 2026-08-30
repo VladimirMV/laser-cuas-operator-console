@@ -7,13 +7,14 @@ interface Props {
   hud: ReplayHud
   t: number
   className?: string
+  hasVideo?: boolean
 }
 
 function clamp(n: number, a: number, b: number) {
   return Math.max(a, Math.min(b, n))
 }
 
-export function ReplayCanvas({ channel, hud, t, className }: Props) {
+export function ReplayCanvas({ channel, hud, t, className, hasVideo }: Props) {
   const ref = useRef<HTMLCanvasElement>(null)
 
   useEffect(() => {
@@ -31,7 +32,9 @@ export function ReplayCanvas({ channel, hud, t, className }: Props) {
     const ir = channel === 'IR'
     const wide = channel === 'WIDE'
 
-    if (ir) {
+    if (hasVideo) {
+      ctx.clearRect(0, 0, w, h)
+    } else if (ir) {
       const g = ctx.createLinearGradient(0, 0, 0, h)
       g.addColorStop(0, '#04060a')
       g.addColorStop(0.55, '#0b1520')
@@ -125,7 +128,7 @@ export function ReplayCanvas({ channel, hud, t, className }: Props) {
     ctx.strokeStyle = 'rgba(255,255,255,0.32)'
     ctx.stroke()
     void t
-  }, [channel, hud, t])
+  }, [channel, hud, t, hasVideo])
 
   return <canvas ref={ref} className={className ?? 'absolute inset-0 h-full w-full'} />
 }

@@ -9,7 +9,7 @@ import {
 import { useHmiStore } from '../store/useHmiStore'
 import { useT } from '../i18n/useT'
 import { cn } from '../lib/utils'
-import type { ArchiveEvent, SessionBundle } from '../types/archive'
+import type { ArchiveEvent, MediaRef, SessionBundle } from '../types/archive'
 import type { CameraChannel } from '../types/hmi'
 import { archiveMock } from '../adapters/archive'
 import { ReplayCanvas } from './ReplayCanvas'
@@ -17,12 +17,63 @@ import { eventColor, eventMarker, fmtClock, hudFromBundle } from '../lib/replayH
 
 type Layout = 'split' | 'pip' | 'single'
 
+function segmentFor(bundle: SessionBundle, channel: CameraChannel, t: number): MediaRef | null {
+  const segs = bundle.media
+    .filter((m) => m.channel === channel && (m.kind === 'SEGMENT' || m.kind === 'CLIP') && m.url)
+    .sort((a, b) => a.t_mono_ms - b.t_mono_ms)
+  if (!segs.length) return null
+  let cur = segs[0]
+  for (const s of segs) {
+    if (s.t_mono_ms <= t) cur = s
+    else break
+  }
+  return cur
+}
+
+function ReplayFeed({
+  bundle, channel, hud, playhead, className,
+}: {
+  bundle: SessionBundle
+  channel: CameraChannel
+  hud: ReturnType<typeof hudFromBundle>
+  playhead: number
+  className?: string
+}) {
+  const vid = useRef<HTMLVideoElement>(null)
+  const seg = hud ? segmentFor(bundle, channel, playhead) : null
+  const url = seg?.url
+  useEffect(() => {
+    const el = vid.current
+    if (!el || !url || !seg) return
+    const off = (playhead - seg.t_mono_ms) / 1000
+    if (Math.abs(el.currentTime - off) > 0.35) {
+      try { el.currentTime = Math.max(0, off) } catch { /* */ }
+    }
+  }, [playhead, url, seg])
+  return (
+    <div className={className}>
+      {url && (
+        <video
+          ref={vid}
+          src={url}
+          muted
+          playsInline
+          className="absolute inset-0 h-full w-full object-cover"
+        />
+      )}
+      <ReplayCanvas channel={channel} hud={hud!} t={playhead} hasVideo={!!url} className="absolute inset-0 h-full w-full" />
+    </div>
+  )
+}
+
+
 export function ArchiveWorkspace() {
   const {
     closeSessions, recording, toggleRecording, eventLog, laserStatus,
     listArchiveSessions, getArchiveBundle, exportArchiveSessionJson, exportArchiveSessionCsv,
     deleteArchiveSession, ensureArchiveSession, recordingProfile, setRecordingPreset,
     setRecChannel, setRecordingCodec, recordingActualCodec,
+    sidecarConnected, mediaRoot, exportEngagementClip,
   } = useHmiStore()
   const { t } = useT()
 
@@ -152,7 +203,7 @@ export function ArchiveWorkspace() {
         <div className="min-w-0">
           <div className="text-xs font-semibold">{t('archives')}</div>
           <div className="text-[10px] font-mono text-[#8B949E]">
-            {t('archLiveLaser')} · {laserStatus}
+            {t('archLiveLaser')} · {laserStatus}{sidecarConnected ? ` · DISK ${mediaRoot}` : ' · META'}
           </div>
         </div>
         <span className="ml-2 hidden sm:inline rounded border border-[#58A6FF]/40 px-1.5 py-0.5 font-mono text-[9px] font-bold text-[#58A6FF]">
@@ -338,17 +389,17 @@ export function ArchiveWorkspace() {
               <div className="relative flex-1 min-h-[220px] bg-black">
                 <div className="absolute inset-0 flex">
                   <div className={cn('relative', showIr && layout === 'split' ? 'w-full md:w-1/2' : 'w-full')}>
-                    <ReplayCanvas channel={ch} hud={hud} t={playhead} className="absolute inset-0 h-full w-full" />
+                    <ReplayFeed bundle={bundle} channel={ch} hud={hud} playhead={playhead} className="absolute inset-0 h-full w-full" />
                   </div>
                   {showIr && layout === 'split' && (
                     <div className="relative hidden md:block w-1/2 border-l border-[#30363D]">
-                      <ReplayCanvas channel="IR" hud={hud} t={playhead} className="absolute inset-0 h-full w-full" />
+                      <ReplayFeed bundle={bundle} channel="IR" hud={hud} playhead={playhead} className="absolute inset-0 h-full w-full" />
                     </div>
                   )}
                 </div>
                 {showIr && (layout === 'pip' || layout === 'split') && (
                   <div className={cn('absolute bottom-10 right-3 z-20 h-24 w-36 overflow-hidden rounded border border-[#30363D] md:h-28 md:w-44', layout === 'split' && 'md:hidden')}>
-                    <ReplayCanvas channel="IR" hud={hud} t={playhead} className="absolute inset-0 h-full w-full" />
+                    <ReplayFeed bundle={bundle} channel="IR" hud={hud} playhead={playhead} className="absolute inset-0 h-full w-full" />
                     <span className="absolute left-1 top-1 font-mono text-[9px] text-[#7ee0c8]">IR</span>
                   </div>
                 )}
@@ -522,14 +573,22 @@ export function ArchiveWorkspace() {
                 type="button"
                 onClick={() => {
                   if (!selectedId || !bundle.engagements[0]) return
-                  const clip = {
-                    session_id: selectedId,
-                    engagement: bundle.engagements[0],
-                    window: { t_minus_s: 15, t_plus_s: 25 },
-                    events: bundle.events.filter((e) => e.engagement_id === bundle.engagements[0].id).map((e) => e.id),
-                    note: 'Demo clip descriptor — sidecar would cut H.265',
-                  }
-                  downloadText(JSON.stringify(clip, null, 2), `${bundle.engagements[0].id}_T-15_T+25.json`, 'application/json')
+                  void (async () => {
+                    const url = await exportEngagementClip(selectedId, ch)
+                    if (url) {
+                      window.open(url, '_blank')
+                      return
+                    }
+                    const clip = {
+                      session_id: selectedId,
+                      engagement: bundle.engagements[0],
+                      window: { t_minus_s: 15, t_plus_s: 25 },
+                      events: bundle.events.filter((e) => e.engagement_id === bundle.engagements[0].id).map((e) => e.id),
+                      note: sidecarConnected ? 'clip failed' : 'sidecar offline — descriptor only',
+                      mediaRoot,
+                    }
+                    downloadText(JSON.stringify(clip, null, 2), `${bundle.engagements[0].id}_T-15_T+25.json`, 'application/json')
+                  })()
                 }}
                 className="w-full py-1.5 rounded border border-[#30363D] text-[10px] font-mono text-[#8B949E] hover:border-[#58A6FF] hover:text-[#58A6FF]"
               >

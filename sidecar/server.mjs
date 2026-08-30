@@ -1,26 +1,20 @@
 /**
- * Laser C-UAS media side-car
- * REST control surface for multi-channel H.265/H.264 recording via FFmpeg.
+ * Laser C-UAS media side-car 1.8.1
+ * Always-on 90 s ring + session H.265/H.264 segments on workstation NVMe.
  *
- * GET  /health
- * GET  /caps
- * GET  /status
- * POST /record/start   { sessionId, channels[], codec?, segmentDurationSec?, bitrates? }
- * POST /record/stop
- * POST /snapshot       { channel, triggerEventId?, label? }
- * GET  /media/*        static files under mediaRoot
- *
- * Env overrides:
- *   SIDECAR_PORT, SIDECAR_HOST, MEDIA_ROOT
- *   STREAM_LONG, STREAM_WIDE, STREAM_IR  (RTSP/SRT/HTTP URLs)
+ * Env: SIDECAR_PORT, SIDECAR_HOST, MEDIA_ROOT, FFMPEG_PATH,
+ *      STREAM_LONG, STREAM_WIDE, STREAM_IR
  */
-
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
-import { spawn, execFileSync } from 'node:child_process'
+import { spawn, execFileSync, execFile } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { createRequire } from 'node:module'
+import { promisify } from 'node:util'
 
+const execFileAsync = promisify(execFile)
+const require = createRequire(import.meta.url)
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 const configPath = path.join(__dirname, 'config.json')
@@ -28,64 +22,66 @@ const config = JSON.parse(fs.readFileSync(configPath, 'utf8'))
 
 const HOST = process.env.SIDECAR_HOST || config.host || '127.0.0.1'
 const PORT = Number(process.env.SIDECAR_PORT || config.port || 8787)
-const MEDIA_ROOT = path.resolve(
-  __dirname,
-  process.env.MEDIA_ROOT || config.mediaRoot || './media'
-)
-const MAPS_ROOT = path.resolve(
-  __dirname,
-  process.env.MAPS_ROOT || config.mapsRoot || './maps/tiles'
-)
-ensureDir(MAPS_ROOT)
-
+const MEDIA_ROOT = path.resolve(__dirname, process.env.MEDIA_ROOT || config.mediaRoot || './media')
+const MAPS_ROOT = path.resolve(__dirname, process.env.MAPS_ROOT || config.mapsRoot || './maps/tiles')
+const RING_SEG = Number(config.ringSegmentSec || 6)
+const RING_WRAP = Number(config.ringWrap || 15)
+const DEFAULT_PREROLL = Number(config.prerollSec || 15)
 const CHANNELS = ['LONG', 'WIDE', 'IR']
-
-function channelUrl(ch) {
-  const envKey = `STREAM_${ch}`
-  if (process.env[envKey]) return process.env[envKey]
-  return (config.channels?.[ch]?.url || '').trim()
+const CORS = {
+  'Access-Control-Allow-Origin': config.corsOrigin || '*',
+  'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type,Range',
+  'Access-Control-Expose-Headers': 'Accept-Ranges,Content-Range,Content-Length',
 }
 
 function ensureDir(p) {
   fs.mkdirSync(p, { recursive: true })
 }
+function ffPath(p) {
+  return p.replace(/\\/g, '/')
+}
 
-ensureDir(MEDIA_ROOT)
-ensureDir(path.join(MEDIA_ROOT, 'ring', 'long'))
-ensureDir(path.join(MEDIA_ROOT, 'ring', 'wide'))
-ensureDir(path.join(MEDIA_ROOT, 'ring', 'ir'))
+function resolveFfmpegBin() {
+  const env = (process.env.FFMPEG_PATH || '').trim()
+  if (env && fs.existsSync(env)) return env
+  const configured = (config.ffmpegPath || '').trim()
+  if (configured && configured !== 'ffmpeg' && fs.existsSync(configured)) return configured
+  try {
+    const packed = require('ffmpeg-static')
+    if (packed && fs.existsSync(packed)) return packed
+  } catch {
+    /* optional */
+  }
+  return configured || 'ffmpeg'
+}
 
-/** @type {import('node:child_process').ChildProcess[]} */
-let ffmpegProcs = []
-let recording = null // { sessionId, channels, codec, actualCodec, startedAt, segmentDurationSec, bitrates, refs[] }
-let segCounters = { LONG: 0, WIDE: 0, IR: 0 }
-
-function probeFfmpeg() {
-  const bin = config.ffmpegPath || 'ffmpeg'
+function probeFfmpeg(bin) {
   try {
     const out = execFileSync(bin, ['-hide_banner', '-encoders'], {
       encoding: 'utf8',
       maxBuffer: 2 * 1024 * 1024,
     })
-    const h265 =
-      /libx265/.test(out) ||
-      /hevc_nvenc/.test(out) ||
-      /hevc_qsv/.test(out) ||
-      /hevc_vaapi/.test(out)
-    const h264 = /libx264/.test(out) || /h264_nvenc/.test(out)
-    const hwAccel = /hevc_nvenc|hevc_qsv|hevc_vaapi|h264_nvenc/.test(out)
-    return { ok: true, bin, h265, h264, hwAccel }
+    return {
+      ok: true,
+      bin,
+      h265: /libx265|hevc_nvenc|hevc_qsv|hevc_vaapi/.test(out),
+      h264: /libx264|h264_nvenc/.test(out),
+      hwAccel: /hevc_nvenc|hevc_qsv|hevc_vaapi|h264_nvenc/.test(out),
+    }
   } catch {
     return { ok: false, bin, h265: false, h264: false, hwAccel: false }
   }
 }
 
-const ffmpegInfo = probeFfmpeg()
+const ffmpegBin = resolveFfmpegBin()
+const ffmpegInfo = probeFfmpeg(ffmpegBin)
 
 function pickEncoder(codec) {
   const preferHw = !!config.preferHw
   if (codec === 'h265') {
-    if (preferHw && /hevc_nvenc/.test(config.hwEncoder || '')) return { enc: 'hevc_nvenc', codecName: 'h265', hw: true }
+    if (preferHw && /hevc_nvenc/.test(config.hwEncoder || '') && ffmpegInfo.hwAccel)
+      return { enc: 'hevc_nvenc', codecName: 'h265', hw: true }
     if (ffmpegInfo.h265) return { enc: 'libx265', codecName: 'h265', hw: false }
     if (ffmpegInfo.h264) return { enc: 'libx264', codecName: 'h264', hw: false }
     return null
@@ -95,157 +91,194 @@ function pickEncoder(codec) {
   return null
 }
 
+function channelUrl(ch) {
+  const envKey = `STREAM_${ch}`
+  if (process.env[envKey]) return process.env[envKey].trim()
+  const cfg = config.channels?.[ch] || {}
+  const primary = (cfg.url || '').trim()
+  if (primary === 'testsrc') return ''
+  if (primary) return primary
+  const lab = (cfg.labUrl || '').trim()
+  return lab
+}
+
 function sessionDir(sessionId) {
   return path.join(MEDIA_ROOT, sessionId)
 }
-
 function channelDir(sessionId, ch) {
   return path.join(sessionDir(sessionId), 'media', ch.toLowerCase())
 }
-
+function ringDir(ch) {
+  return path.join(MEDIA_ROOT, 'ring', ch.toLowerCase())
+}
 function appendIndex(sessionId, row) {
-  const dir = sessionDir(sessionId)
-  ensureDir(dir)
-  const line = JSON.stringify(row) + '\n'
-  fs.appendFileSync(path.join(dir, 'media_index.jsonl'), line)
+  ensureDir(sessionDir(sessionId))
+  fs.appendFileSync(path.join(sessionDir(sessionId), 'media_index.jsonl'), JSON.stringify(row) + '\n')
 }
 
-function buildFfmpegArgs(ch, sessionId, encoder, bitrateKbps, segmentSec) {
+function geometry(ch) {
+  if (ch === 'LONG') return { size: '1920x1080', w: 1920, h: 1080, fps: 30 }
+  if (ch === 'WIDE') return { size: '1280x720', w: 1280, h: 720, fps: 30 }
+  return { size: '640x512', w: 640, h: 512, fps: 30 }
+}
+
+function inputArgs(ch, { realtime = true } = {}) {
   const url = channelUrl(ch)
-  const outDir = channelDir(sessionId, ch)
-  ensureDir(outDir)
-  const pattern = path.join(outDir, `seg_%04d_${encoder.codecName}.mp4`)
-
-  const args = ['-y', '-hide_banner', '-loglevel', 'warning']
-
-  if (url) {
-    if (url.startsWith('rtsp://')) {
-      args.push('-rtsp_transport', 'tcp', '-i', url)
-    } else {
-      args.push('-i', url)
-    }
-  } else {
-    // Lab pattern when no camera URL configured
-    const size =
-      ch === 'LONG' ? '1920x1080' : ch === 'WIDE' ? '1280x720' : '640x512'
-    const rate = '30'
-    args.push(
-      '-f',
-      'lavfi',
-      '-i',
-      `testsrc=size=${size}:rate=${rate}`,
-      '-f',
-      'lavfi',
-      '-i',
-      'anullsrc=channel_layout=mono:sample_rate=48000'
-    )
+  const g = geometry(ch)
+  if (url && !url.startsWith('testsrc')) {
+    const args = []
+    if (realtime) args.push('-re')
+    if (url.startsWith('rtsp://')) args.push('-rtsp_transport', 'tcp')
+    if (/^https?:/i.test(url) || /\.(mp4|mkv|mov|ts)$/i.test(url)) args.push('-stream_loop', '-1')
+    args.push('-i', url)
+    return { args, fromUrl: url }
   }
-
-  args.push('-map', '0:v:0')
-  if (!url) {
-    // no audio in output
+  return {
+    args: ['-f', 'lavfi', '-i', `testsrc=size=${g.size}:rate=${g.fps}`],
+    fromUrl: null,
   }
-
-  const gop = Math.max(30, Number(segmentSec) * 30)
-  if (encoder.enc === 'libx265') {
-    args.push(
-      '-c:v',
-      'libx265',
-      '-preset',
-      'medium',
-      '-x265-params',
-      `keyint=${gop}:min-keyint=${gop}:scenecut=0`,
-      '-b:v',
-      `${bitrateKbps}k`,
-      '-pix_fmt',
-      'yuv420p'
-    )
-  } else if (encoder.enc === 'hevc_nvenc') {
-    args.push(
-      '-c:v',
-      'hevc_nvenc',
-      '-preset',
-      'p4',
-      '-b:v',
-      `${bitrateKbps}k`,
-      '-pix_fmt',
-      'yuv420p'
-    )
-  } else {
-    args.push(
-      '-c:v',
-      'libx264',
-      '-preset',
-      'veryfast',
-      '-b:v',
-      `${bitrateKbps}k`,
-      '-pix_fmt',
-      'yuv420p',
-      '-g',
-      String(gop)
-    )
-  }
-
-  args.push('-an')
-  args.push(
-    '-f',
-    'segment',
-    '-segment_time',
-    String(segmentSec),
-    '-reset_timestamps',
-    '1',
-    '-strftime',
-    '0',
-    pattern
-  )
-
-  return { args, pattern, outDir }
 }
 
-function spawnChannel(ch, sessionId, encoder, bitrateKbps, segmentSec) {
-  const { args, outDir } = buildFfmpegArgs(ch, sessionId, encoder, bitrateKbps, segmentSec)
-  const bin = ffmpegInfo.bin
-  console.log(`[sidecar] start ${ch} → ${outDir} (${encoder.enc} ${bitrateKbps}k)`)
-  const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+function videoEncodeArgs(encoder, bitrateKbps, gop) {
+  if (encoder.enc === 'libx265') {
+    return [
+      '-c:v', 'libx265', '-preset', 'veryfast',
+      '-x265-params', `keyint=${gop}:min-keyint=${gop}:scenecut=0`,
+      '-b:v', `${bitrateKbps}k`, '-pix_fmt', 'yuv420p',
+    ]
+  }
+  if (encoder.enc === 'hevc_nvenc') {
+    return ['-c:v', 'hevc_nvenc', '-preset', 'p4', '-b:v', `${bitrateKbps}k`, '-pix_fmt', 'yuv420p', '-g', String(gop)]
+  }
+  return [
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+    '-b:v', `${bitrateKbps}k`, '-pix_fmt', 'yuv420p', '-g', String(gop),
+  ]
+}
+
+function spawnLogged(bin, args, tag) {
+  const proc = spawn(bin, args, { stdio: ['pipe', 'pipe', 'pipe'] })
   proc.stderr.on('data', (d) => {
     const s = d.toString().trim()
-    if (s) console.log(`[ffmpeg:${ch}] ${s}`)
+    if (s) console.log(`[ffmpeg:${tag}] ${s}`)
   })
   proc.on('exit', (code, signal) => {
-    console.log(`[sidecar] ${ch} exited code=${code} signal=${signal}`)
+    console.log(`[sidecar] ${tag} exited code=${code} signal=${signal}`)
   })
   return proc
 }
 
-function listNewSegments(sessionId, ch, codecName) {
-  const dir = channelDir(sessionId, ch)
+/** @type {Record<string, import('node:child_process').ChildProcess>} */
+const ringProcs = {}
+let ringHot = false
+
+function startRing() {
+  const enc = pickEncoder('h264') || pickEncoder('h265')
+  if (!ffmpegInfo.ok || !enc) {
+    console.warn('[sidecar] ring not started — FFmpeg encoder missing')
+    ringHot = false
+    return
+  }
+  for (const ch of CHANNELS) {
+    const dir = ringDir(ch)
+    ensureDir(dir)
+    const pattern = ffPath(path.join(dir, 'r_%02d.mp4'))
+    const { args: inArgs, fromUrl } = inputArgs(ch)
+    const gop = RING_SEG * geometry(ch).fps
+    const br = Math.round((config.bitratesKbps?.[ch] ?? 3000) * 0.5)
+    const args = [
+      '-y', '-hide_banner', '-loglevel', 'warning',
+      ...inArgs,
+      '-map', '0:v:0', '-an',
+      ...videoEncodeArgs({ enc: 'libx264', codecName: 'h264', hw: false }, br, gop),
+      '-f', 'segment',
+      '-segment_time', String(RING_SEG),
+      '-segment_wrap', String(RING_WRAP),
+      '-reset_timestamps', '1',
+      '-segment_format_options', 'movflags=frag_keyframe+empty_moov+default_base_moof',
+      pattern,
+    ]
+    console.log(`[sidecar] ring ${ch} ← ${fromUrl || 'testsrc'} → ${dir}`)
+    ringProcs[ch] = spawnLogged(ffmpegBin, args, `ring:${ch}`)
+  }
+  ringHot = CHANNELS.every((ch) => ringProcs[ch] && !ringProcs[ch].killed)
+  for (const ch of CHANNELS) {
+    ringProcs[ch]?.on('exit', () => {
+      ringHot = CHANNELS.every((c) => ringProcs[c] && ringProcs[c].exitCode == null && !ringProcs[c].killed)
+    })
+  }
+}
+
+function listRingFiles(ch) {
+  const dir = ringDir(ch)
   if (!fs.existsSync(dir)) return []
   return fs
     .readdirSync(dir)
     .filter((f) => f.endsWith('.mp4'))
-    .map((f) => ({
-      channel: ch,
-      file: f,
-      path: path.join(dir, f),
-      rel: path.relative(MEDIA_ROOT, path.join(dir, f)).replace(/\\/g, '/'),
-      codec: codecName,
-    }))
+    .map((f) => {
+      const p = path.join(dir, f)
+      const st = fs.statSync(p)
+      return { file: f, path: p, mtime: st.mtimeMs, size: st.size }
+    })
+    .filter((x) => x.size > 1024)
+    .sort((a, b) => a.mtime - b.mtime)
 }
 
-/** Rename FFmpeg `seg_%04d_{codec}.mp4` → `seg_{nnnn}_t{mono}_{codec}.mp4` on stop. */
+function copyPreroll(sessionId, channels, prerollSec) {
+  const n = Math.max(1, Math.ceil(Number(prerollSec || DEFAULT_PREROLL) / RING_SEG))
+  const refs = []
+  const t0 = Date.now()
+  for (const ch of channels) {
+    const files = listRingFiles(ch)
+    const closed = files.length > 1 ? files.slice(0, -1) : files
+    const take = closed.slice(-n)
+    const dest = path.join(channelDir(sessionId, ch), 'preroll')
+    ensureDir(dest)
+    take.forEach((item, i) => {
+      const t = i * RING_SEG * 1000
+      const name = `preroll_${String(i).padStart(2, '0')}_t${String(t).padStart(6, '0')}.mp4`
+      const to = path.join(dest, name)
+      try {
+        fs.copyFileSync(item.path, to)
+      } catch (e) {
+        console.warn(`[sidecar] preroll copy ${ch}: ${e.message}`)
+        return
+      }
+      const rel = path.relative(MEDIA_ROOT, to).replace(/\\/g, '/')
+      const ref = {
+        id: `MED-pre-${ch}-${i}-${t0}`,
+        ts_utc: new Date(t0).toISOString(),
+        t_mono_ms: t,
+        session_id: sessionId,
+        channel: ch,
+        kind: 'SEGMENT',
+        label: `PREROLL ${ch} −${prerollSec}s from ring`,
+        codec: 'h264',
+        container: 'mp4',
+        duration_ms: RING_SEG * 1000,
+        path: rel,
+        url: `/media/${rel}`,
+      }
+      refs.push(ref)
+      appendIndex(sessionId, ref)
+    })
+  }
+  return refs
+}
+
 function renameSegmentsWithMono(sessionId, ch, codecName, segmentDurationSec) {
   const dir = channelDir(sessionId, ch)
   if (!fs.existsSync(dir)) return []
   const files = fs
     .readdirSync(dir)
-    .filter((f) => f.endsWith('.mp4'))
+    .filter((f) => f.endsWith('.mp4') && (f.startsWith('seg_') || f.startsWith('rec_live_')))
     .sort()
   const out = []
   for (let idx = 0; idx < files.length; idx++) {
     const f = files[idx]
     const m = f.match(/^seg_(\d+)/)
     const i = m ? Number(m[1]) : idx
-    const t = i * Number(segmentDurationSec || 60) * 1000
+    const t = i * Number(segmentDurationSec || 15) * 1000
     const tPad = String(Math.floor(t)).padStart(6, '0')
     const next = `seg_${String(i).padStart(4, '0')}_t${tPad}_${codecName}.mp4`
     const from = path.join(dir, f)
@@ -254,7 +287,7 @@ function renameSegmentsWithMono(sessionId, ch, codecName, segmentDurationSec) {
       try {
         if (fs.existsSync(from) && !fs.existsSync(to)) fs.renameSync(from, to)
       } catch {
-        /* keep original name */
+        /* keep */
       }
     }
     const name = fs.existsSync(to) ? next : f
@@ -270,33 +303,14 @@ function renameSegmentsWithMono(sessionId, ch, codecName, segmentDurationSec) {
   return out
 }
 
-function json(res, status, body) {
-  const data = JSON.stringify(body)
-  res.writeHead(status, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Access-Control-Allow-Origin': config.corsOrigin || '*',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
-  })
-  res.end(data)
-}
+ensureDir(MEDIA_ROOT)
+ensureDir(MAPS_ROOT)
+for (const ch of CHANNELS) ensureDir(ringDir(ch))
 
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = []
-    req.on('data', (c) => chunks.push(c))
-    req.on('end', () => {
-      const raw = Buffer.concat(chunks).toString('utf8')
-      if (!raw) return resolve({})
-      try {
-        resolve(JSON.parse(raw))
-      } catch (e) {
-        reject(e)
-      }
-    })
-    req.on('error', reject)
-  })
-}
+/** @type {null | object} */
+let recording = null
+/** @type {import('node:child_process').ChildProcess[]} */
+let ffmpegProcs = []
 
 function getCaps() {
   return {
@@ -307,20 +321,32 @@ function getCaps() {
     maxChannels: 3,
     metaOnly: false,
     ffmpeg: ffmpegInfo.ok,
-    channelsConfigured: Object.fromEntries(
-      CHANNELS.map((ch) => [ch, Boolean(channelUrl(ch))])
-    ),
+    ffmpegBin,
     mediaRoot: MEDIA_ROOT,
+    ringHot,
+    prerollSec: DEFAULT_PREROLL,
+    ringSeconds: RING_SEG * RING_WRAP,
+    channelsConfigured: Object.fromEntries(CHANNELS.map((ch) => [ch, Boolean(channelUrl(ch))])),
   }
 }
 
+function diskBytes() {
+  let n = 0
+  const walk = (d) => {
+    if (!fs.existsSync(d)) return
+    for (const ent of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, ent.name)
+      if (ent.isDirectory()) walk(p)
+      else n += fs.statSync(p).size
+    }
+  }
+  walk(MEDIA_ROOT)
+  return n
+}
+
 async function handleStart(body) {
-  if (recording) {
-    return { ok: false, message: 'Already recording', sessionId: recording.sessionId }
-  }
-  if (!ffmpegInfo.ok) {
-    return { ok: false, message: 'FFmpeg not available on side-car host' }
-  }
+  if (recording) return { ok: false, message: 'Already recording', sessionId: recording.sessionId }
+  if (!ffmpegInfo.ok) return { ok: false, message: 'FFmpeg not available on side-car host' }
 
   const sessionId = String(body.sessionId || `SES-${Date.now()}`)
   let channels = Array.isArray(body.channels) ? body.channels.map(String) : ['LONG', 'IR']
@@ -331,7 +357,8 @@ async function handleStart(body) {
   const encoder = pickEncoder(wantCodec)
   if (!encoder) return { ok: false, message: 'No suitable video encoder' }
 
-  const segmentDurationSec = Number(body.segmentDurationSec || config.segmentDurationSec || 60)
+  const segmentDurationSec = Number(body.segmentDurationSec || config.segmentDurationSec || 15)
+  const prerollSec = Number(body.prerollSec || DEFAULT_PREROLL)
   const bitrates = {
     LONG: config.bitratesKbps?.LONG ?? 6000,
     WIDE: config.bitratesKbps?.WIDE ?? 3000,
@@ -341,16 +368,32 @@ async function handleStart(body) {
 
   ensureDir(sessionDir(sessionId))
   ensureDir(path.join(sessionDir(sessionId), 'media', 'snapshots'))
+  ensureDir(path.join(sessionDir(sessionId), 'media', 'clips'))
 
-  segCounters = { LONG: 0, WIDE: 0, IR: 0 }
+  const prerollRefs = copyPreroll(sessionId, channels, prerollSec)
+
   ffmpegProcs = []
-  const refs = []
+  const refs = [...prerollRefs]
   const t0 = Date.now()
 
   for (const ch of channels) {
     const br = bitrates[ch] || 3000
-    const proc = spawnChannel(ch, sessionId, encoder, br, segmentDurationSec)
-    ffmpegProcs.push(proc)
+    const outDir = channelDir(sessionId, ch)
+    ensureDir(outDir)
+    const outFile = ffPath(path.join(outDir, `rec_live_${encoder.codecName}.mp4`))
+    const { args: inArgs, fromUrl } = inputArgs(ch)
+    const gop = Math.max(geometry(ch).fps, 2 * geometry(ch).fps)
+    const args = [
+      '-y', '-hide_banner', '-loglevel', 'warning',
+      ...inArgs,
+      '-map', '0:v:0', '-an',
+      ...videoEncodeArgs(encoder, br, gop),
+      '-f', 'mp4',
+      '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+      outFile,
+    ]
+    console.log(`[sidecar] REC ${ch} ← ${fromUrl || 'testsrc'} → ${outDir} (${encoder.enc} ${br}k)`)
+    ffmpegProcs.push(spawnLogged(ffmpegBin, args, ch))
     const ref = {
       id: `MED-open-${ch}-${t0}`,
       ts_utc: new Date(t0).toISOString(),
@@ -363,7 +406,7 @@ async function handleStart(body) {
       container: 'mp4',
       bitrate_kbps: br,
       hw_encoder: encoder.hw,
-      path: path.relative(MEDIA_ROOT, channelDir(sessionId, ch)).replace(/\\/g, '/'),
+      path: path.relative(MEDIA_ROOT, outDir).replace(/\\/g, '/'),
     }
     refs.push(ref)
     appendIndex(sessionId, ref)
@@ -377,6 +420,7 @@ async function handleStart(body) {
     encoder: encoder.enc,
     startedAt: t0,
     segmentDurationSec,
+    prerollSec,
     bitrates,
     refs,
   }
@@ -389,40 +433,29 @@ async function handleStart(body) {
     codec_actual: encoder.codecName,
     encoder: encoder.enc,
     mediaRoot: MEDIA_ROOT,
+    prerollCopied: prerollRefs.length,
     refs,
   }
 }
 
 async function handleStop() {
   if (!recording) return { ok: false, message: 'Not recording', refs: [] }
-
   const snap = recording
   for (const p of ffmpegProcs) {
     try {
-      p.kill('SIGINT')
-    } catch {
-      /* */
-    }
+      p.stdin?.write('q')
+      p.stdin?.end()
+    } catch { /* */ }
   }
-  // Wait briefly for flush
-  await new Promise((r) => setTimeout(r, 800))
+  await new Promise((r) => setTimeout(r, 2500))
   for (const p of ffmpegProcs) {
-    try {
-      if (!p.killed) p.kill('SIGKILL')
-    } catch {
-      /* */
-    }
+    try { if (!p.killed && p.exitCode == null) p.kill('SIGKILL') } catch { /* */ }
   }
   ffmpegProcs = []
 
   const files = []
   for (const ch of snap.channels) {
-    for (const seg of renameSegmentsWithMono(
-      snap.sessionId,
-      ch,
-      snap.actualCodec,
-      snap.segmentDurationSec
-    )) {
+    for (const seg of renameSegmentsWithMono(snap.sessionId, ch, snap.actualCodec, snap.segmentDurationSec)) {
       const ref = {
         id: `MED-seg-${ch}-${path.basename(seg.file)}`,
         ts_utc: new Date().toISOString(),
@@ -440,44 +473,32 @@ async function handleStop() {
       appendIndex(snap.sessionId, ref)
     }
   }
-
   recording = null
   return {
     ok: true,
     sessionId: snap.sessionId,
     refs: files,
     durationMs: Date.now() - snap.startedAt,
+    mediaRoot: MEDIA_ROOT,
   }
 }
 
 async function handleSnapshot(body) {
   const ch = String(body.channel || 'LONG')
   if (!CHANNELS.includes(ch)) return { ok: false, message: 'Bad channel' }
-
   const sessionId = recording?.sessionId || String(body.sessionId || 'SNAPSHOT')
   const snapDir = path.join(sessionDir(sessionId), 'media', 'snapshots')
   ensureDir(snapDir)
   const mono = recording ? Date.now() - recording.startedAt : 0
   const name = `${mono}_${body.triggerEventId || 'SNAP'}_${ch}.jpg`
   const outFile = path.join(snapDir, name)
-
-  const url = channelUrl(ch)
-  const bin = ffmpegInfo.bin
-  const args = ['-y', '-hide_banner', '-loglevel', 'error']
-  if (url) {
-    if (url.startsWith('rtsp://')) args.push('-rtsp_transport', 'tcp')
-    args.push('-i', url, '-frames:v', '1', '-q:v', '2', outFile)
-  } else {
-    const size = ch === 'LONG' ? '1920x1080' : ch === 'WIDE' ? '1280x720' : '640x512'
-    args.push('-f', 'lavfi', '-i', `testsrc=size=${size}:rate=1`, '-frames:v', '1', '-q:v', '2', outFile)
-  }
-
+  const { args: inArgs } = inputArgs(ch, { realtime: false })
+  const args = ['-y', '-hide_banner', '-loglevel', 'error', ...inArgs, '-frames:v', '1', '-q:v', '2', outFile]
   try {
-    execFileSync(bin, args, { timeout: 15000 })
+    execFileSync(ffmpegBin, args, { timeout: 20000 })
   } catch (e) {
     return { ok: false, message: `snapshot failed: ${e.message}` }
   }
-
   const rel = path.relative(MEDIA_ROOT, outFile).replace(/\\/g, '/')
   const ref = {
     id: `MED-snap-${Date.now()}`,
@@ -497,17 +518,111 @@ async function handleSnapshot(body) {
   return { ok: true, ref }
 }
 
+async function handleClip(body) {
+  const sessionId = String(body.sessionId || '')
+  const ch = String(body.channel || 'LONG')
+  if (!sessionId) return { ok: false, message: 'sessionId required' }
+  if (!CHANNELS.includes(ch)) return { ok: false, message: 'Bad channel' }
+  const tStart = Math.max(0, Number(body.tStartMs || 0))
+  const tEnd = Math.max(tStart + 500, Number(body.tEndMs || tStart + 40_000))
+  const dir = channelDir(sessionId, ch)
+  const prerollDir = path.join(dir, 'preroll')
+  const files = []
+  if (fs.existsSync(prerollDir)) {
+    for (const f of fs.readdirSync(prerollDir).filter((x) => x.endsWith('.mp4')).sort()) {
+      files.push(path.join(prerollDir, f))
+    }
+  }
+  if (fs.existsSync(dir)) {
+    for (const f of fs.readdirSync(dir).filter((x) => x.endsWith('.mp4') && x.startsWith('seg_')).sort()) {
+      files.push(path.join(dir, f))
+    }
+  }
+  if (!files.length) return { ok: false, message: 'No segments to cut' }
+
+  const clipDir = path.join(sessionDir(sessionId), 'media', 'clips')
+  ensureDir(clipDir)
+  const label = String(body.label || `ENG_T-${Math.round(tStart / 1000)}_T+${Math.round(tEnd / 1000)}_${ch.toLowerCase()}`)
+  const safe = label.replace(/[^\w.\-+]+/g, '_')
+  const outFile = path.join(clipDir, `${safe}.mp4`)
+  const listFile = path.join(clipDir, `${safe}.txt`)
+  fs.writeFileSync(listFile, files.map((f) => `file '${ffPath(f)}'`).join('\n'))
+
+  const ss = (tStart / 1000).toFixed(3)
+  const dur = ((tEnd - tStart) / 1000).toFixed(3)
+  try {
+    await execFileAsync(
+      ffmpegBin,
+      ['-y', '-hide_banner', '-loglevel', 'error', '-f', 'concat', '-safe', '0', '-i', listFile, '-ss', ss, '-t', dur, '-c', 'copy', outFile],
+      { timeout: 60000 }
+    )
+  } catch (e) {
+    try {
+      await execFileAsync(
+        ffmpegBin,
+        ['-y', '-hide_banner', '-loglevel', 'error', '-f', 'concat', '-safe', '0', '-i', listFile, '-ss', ss, '-t', dur, '-c:v', 'libx264', '-an', outFile],
+        { timeout: 120000 }
+      )
+    } catch (e2) {
+      return { ok: false, message: `clip failed: ${e2.message}` }
+    }
+  }
+  const rel = path.relative(MEDIA_ROOT, outFile).replace(/\\/g, '/')
+  const ref = {
+    id: `MED-clip-${Date.now()}`,
+    ts_utc: new Date().toISOString(),
+    t_mono_ms: tStart,
+    session_id: sessionId,
+    channel: ch,
+    kind: 'CLIP',
+    label,
+    codec: 'h264',
+    container: 'mp4',
+    duration_ms: tEnd - tStart,
+    path: rel,
+    url: `/media/${rel}`,
+  }
+  appendIndex(sessionId, ref)
+  return { ok: true, ref }
+}
+
+function listSessions() {
+  if (!fs.existsSync(MEDIA_ROOT)) return []
+  const out = []
+  for (const name of fs.readdirSync(MEDIA_ROOT)) {
+    if (name === 'ring') continue
+    const dir = path.join(MEDIA_ROOT, name)
+    if (!fs.statSync(dir).isDirectory()) continue
+    let files = 0
+    let bytes = 0
+    const walk = (d) => {
+      for (const ent of fs.readdirSync(d, { withFileTypes: true })) {
+        const p = path.join(d, ent.name)
+        if (ent.isDirectory()) walk(p)
+        else {
+          files++
+          bytes += fs.statSync(p).size
+        }
+      }
+    }
+    walk(dir)
+    out.push({ id: name, files, bytes, path: dir })
+  }
+  return out.sort((a, b) => b.id.localeCompare(a.id))
+}
+
 function serveStatic(req, res, urlPath) {
   const rel = decodeURIComponent(urlPath.replace(/^\/media\/?/, ''))
-  const file = path.join(MEDIA_ROOT, rel)
+  const file = path.normalize(path.join(MEDIA_ROOT, rel))
   if (!file.startsWith(MEDIA_ROOT)) {
-    res.writeHead(403)
+    res.writeHead(403, CORS)
     return res.end('Forbidden')
   }
   if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) {
-    res.writeHead(404)
+    res.writeHead(404, CORS)
     return res.end('Not found')
   }
+  const st = fs.statSync(file)
   const ext = path.extname(file).toLowerCase()
   const types = {
     '.mp4': 'video/mp4',
@@ -515,37 +630,73 @@ function serveStatic(req, res, urlPath) {
     '.jpeg': 'image/jpeg',
     '.jsonl': 'application/x-ndjson',
     '.json': 'application/json',
+    '.txt': 'text/plain',
+  }
+  const type = types[ext] || 'application/octet-stream'
+  const range = req.headers.range
+  if (range) {
+    const m = /bytes=(\d*)-(\d*)/.exec(range)
+    const start = m && m[1] ? Number(m[1]) : 0
+    const end = m && m[2] ? Number(m[2]) : st.size - 1
+    if (start >= st.size || end >= st.size) {
+      res.writeHead(416, { ...CORS, 'Content-Range': `bytes */${st.size}` })
+      return res.end()
+    }
+    res.writeHead(206, {
+      ...CORS,
+      'Content-Type': type,
+      'Accept-Ranges': 'bytes',
+      'Content-Range': `bytes ${start}-${end}/${st.size}`,
+      'Content-Length': end - start + 1,
+    })
+    return fs.createReadStream(file, { start, end }).pipe(res)
   }
   res.writeHead(200, {
-    'Content-Type': types[ext] || 'application/octet-stream',
-    'Access-Control-Allow-Origin': config.corsOrigin || '*',
+    ...CORS,
+    'Content-Type': type,
+    'Accept-Ranges': 'bytes',
+    'Content-Length': st.size,
   })
   fs.createReadStream(file).pipe(res)
+}
+
+function json(res, status, body) {
+  const data = JSON.stringify(body)
+  res.writeHead(status, { ...CORS, 'Content-Type': 'application/json; charset=utf-8' })
+  res.end(data)
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    req.on('data', (c) => chunks.push(c))
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8')
+      if (!raw) return resolve({})
+      try { resolve(JSON.parse(raw)) } catch (e) { reject(e) }
+    })
+    req.on('error', reject)
+  })
 }
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${HOST}:${PORT}`)
   const method = req.method || 'GET'
-
   if (method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': config.corsOrigin || '*',
-      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-    })
+    res.writeHead(204, CORS)
     return res.end()
   }
-
   try {
     if (method === 'GET' && url.pathname === '/health') {
-      return json(res, 200, { ok: true, service: 'laser-cuas-media-sidecar', ffmpeg: ffmpegInfo.ok })
+      return json(res, 200, { ok: true, service: 'laser-cuas-media-sidecar', version: '1.8.1', ffmpeg: ffmpegInfo.ok, ringHot })
     }
-    if (method === 'GET' && url.pathname === '/caps') {
-      return json(res, 200, getCaps())
-    }
+    if (method === 'GET' && url.pathname === '/caps') return json(res, 200, getCaps())
     if (method === 'GET' && url.pathname === '/status') {
       return json(res, 200, {
         recording: Boolean(recording),
+        ringHot,
+        mediaRoot: MEDIA_ROOT,
+        diskBytes: diskBytes(),
         session: recording
           ? {
               sessionId: recording.sessionId,
@@ -556,11 +707,16 @@ const server = http.createServer(async (req, res) => {
               elapsedMs: Date.now() - recording.startedAt,
             }
           : null,
+        ring: Object.fromEntries(
+          CHANNELS.map((ch) => [ch, { files: listRingFiles(ch).length, dir: ringDir(ch) }])
+        ),
       })
     }
+    if (method === 'GET' && url.pathname === '/sessions') {
+      return json(res, 200, { ok: true, mediaRoot: MEDIA_ROOT, sessions: listSessions() })
+    }
     if (method === 'POST' && url.pathname === '/record/start') {
-      const body = await readBody(req)
-      const result = await handleStart(body)
+      const result = await handleStart(await readBody(req))
       return json(res, result.ok ? 200 : 400, result)
     }
     if (method === 'POST' && url.pathname === '/record/stop') {
@@ -568,8 +724,11 @@ const server = http.createServer(async (req, res) => {
       return json(res, result.ok ? 200 : 400, result)
     }
     if (method === 'POST' && url.pathname === '/snapshot') {
-      const body = await readBody(req)
-      const result = await handleSnapshot(body)
+      const result = await handleSnapshot(await readBody(req))
+      return json(res, result.ok ? 200 : 400, result)
+    }
+    if (method === 'POST' && url.pathname === '/clip') {
+      const result = await handleClip(await readBody(req))
       return json(res, result.ok ? 200 : 400, result)
     }
     if (method === 'GET' && url.pathname === '/map/status') {
@@ -579,17 +738,11 @@ const server = http.createServer(async (req, res) => {
         for (const n of fs.readdirSync(d, { withFileTypes: true })) {
           const p = path.join(d, n.name)
           if (n.isDirectory()) walk(p)
-          else if (/\.png$/i.test(n.name) || /\.jpg$/i.test(n.name) || /\.webp$/i.test(n.name)) files++
+          else if (/\.(png|jpg|webp)$/i.test(n.name)) files++
         }
       }
       walk(MAPS_ROOT)
-      return json(res, 200, {
-        ok: true,
-        offline: files > 0,
-        tiles: files,
-        root: MAPS_ROOT,
-        urlTemplate: '/map/tiles/{z}/{x}/{y}.png',
-      })
+      return json(res, 200, { ok: true, offline: files > 0, tiles: files, root: MAPS_ROOT, urlTemplate: '/map/tiles/{z}/{x}/{y}.png' })
     }
     if (method === 'GET' && url.pathname.startsWith('/map/tiles/')) {
       const parts = url.pathname.replace('/map/tiles/', '').split('/')
@@ -601,20 +754,15 @@ const server = http.createServer(async (req, res) => {
       }
       const file = path.join(MAPS_ROOT, z, x, `${y}.png`)
       if (!file.startsWith(MAPS_ROOT) || !fs.existsSync(file)) {
-        res.writeHead(404, { 'Access-Control-Allow-Origin': config.corsOrigin || '*' })
+        res.writeHead(404, CORS)
         return res.end()
       }
-      res.writeHead(200, {
-        'Content-Type': 'image/png',
-        'Cache-Control': 'public, max-age=86400',
-        'Access-Control-Allow-Origin': config.corsOrigin || '*',
-      })
+      res.writeHead(200, { ...CORS, 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400' })
       return fs.createReadStream(file).pipe(res)
     }
     if (method === 'GET' && url.pathname.startsWith('/media/')) {
       return serveStatic(req, res, url.pathname)
     }
-
     json(res, 404, { ok: false, message: 'Not found' })
   } catch (e) {
     console.error(e)
@@ -622,29 +770,27 @@ const server = http.createServer(async (req, res) => {
   }
 })
 
-server.listen(PORT, HOST, () => {
-  console.log(`[sidecar] Laser C-UAS media side-car on http://${HOST}:${PORT}`)
-  console.log(`[sidecar] mediaRoot=${MEDIA_ROOT}`)
-  console.log(`[sidecar] mapsRoot=${MAPS_ROOT}`)
-  console.log(
-    `[sidecar] ffmpeg=${ffmpegInfo.ok} h265=${ffmpegInfo.h265} h264=${ffmpegInfo.h264}`
-  )
-  for (const ch of CHANNELS) {
-    const u = channelUrl(ch)
-    console.log(`[sidecar] ${ch}: ${u || '(testsrc lab pattern)'}`)
-  }
-})
-
 function shutdown() {
   console.log('[sidecar] shutting down…')
+  for (const p of Object.values(ringProcs)) {
+    try { p.kill('SIGKILL') } catch { /* */ }
+  }
   for (const p of ffmpegProcs) {
-    try {
-      p.kill('SIGKILL')
-    } catch {
-      /* */
-    }
+    try { p.kill('SIGKILL') } catch { /* */ }
   }
   server.close(() => process.exit(0))
 }
 process.on('SIGINT', shutdown)
 process.on('SIGTERM', shutdown)
+
+server.listen(PORT, HOST, () => {
+  console.log(`[sidecar] Laser C-UAS media 1.8.1  http://${HOST}:${PORT}`)
+  console.log(`[sidecar] mediaRoot=${MEDIA_ROOT}`)
+  console.log(`[sidecar] ffmpeg=${ffmpegInfo.ok} bin=${ffmpegBin} h265=${ffmpegInfo.h265} h264=${ffmpegInfo.h264}`)
+  for (const ch of CHANNELS) {
+    console.log(`[sidecar] ${ch}: ${channelUrl(ch) || '(testsrc)'}`)
+  }
+  startRing()
+  ringHot = CHANNELS.every((ch) => ringProcs[ch] && ringProcs[ch].exitCode == null)
+  console.log(`[sidecar] ringHot=${ringHot}  ${RING_SEG}s × ${RING_WRAP} = ${RING_SEG * RING_WRAP}s`)
+})

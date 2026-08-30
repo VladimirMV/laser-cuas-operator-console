@@ -1,14 +1,15 @@
 {
   "name": "laser-cuas-operator-interface",
   "private": true,
-  "version": "1.8.0",
+  "version": "1.8.1",
   "type": "module",
-  "description": "Laser C-UAS HMI v1.8.0 — Operator Console · Archive Replay + HUD",
+  "description": "Laser C-UAS HMI v1.8.0 — Operator Console · Archive Replay + real disk recording",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "vite build",
     "preview": "vite preview",
-    "start": "node serve-dist.mjs"
+    "start": "node serve-dist.mjs",
+    "sidecar": "node sidecar/server.mjs"
   },
   "dependencies": {
     "clsx": "^2.1.1",

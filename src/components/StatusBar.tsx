@@ -14,7 +14,7 @@ export function StatusBar() {
     gamepadConnected, turretLink, platform, laserTelemetry,
     toggleHelp,
     biteItems,
-    combatChrome, setCombatChrome, ringHot, setRecChannel,
+    combatChrome, setCombatChrome, ringHot, setRecChannel, sidecarConnected, mediaRoot,
   } = useHmiStore()
   const { t, lang } = useT()
   const [time, setTime] = useState('')
@@ -142,7 +142,7 @@ export function StatusBar() {
         {ringHot && (
           <span
             className="hidden sm:inline px-1.5 py-0.5 rounded border border-[#58A6FF]/40 text-[#58A6FF] text-[9px] font-mono font-bold"
-            title={t('recRingHint')}
+            title={sidecarConnected && mediaRoot ? `${t('recRingHint')} · ${mediaRoot}` : t('recRingHint')}
           >
             {t('ringHot')}
           </span>

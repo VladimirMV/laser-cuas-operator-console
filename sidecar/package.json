@@ -1,6 +1,6 @@
 {
   "name": "laser-cuas-media-sidecar",
-  "version": "1.0.0",
+  "version": "1.8.1",
   "private": true,
   "type": "module",
   "description": "H.265 multi-channel media side-car for Laser C-UAS HMI (FFmpeg)",
@@ -10,5 +10,8 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "optionalDependencies": {
+    "ffmpeg-static": "^5.2.0"
   }
 }

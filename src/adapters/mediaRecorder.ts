@@ -1,10 +1,11 @@
 /**
  * Multi-channel media recorder contracts.
- * Production target codec: H.265 (HEVC). Browser demo = meta index only.
+ * Production: workstation sidecar writes real H.265/H.264 files.
+ * Demo fallback: MockMediaRecorder (index only).
  */
 
 import type { CameraChannel } from '../types/hmi'
-import type { MediaCodec, MediaContainer, MediaRef } from '../types/archive'
+import type { MediaCodec, MediaRef } from '../types/archive'
 import { archiveMock } from './archive'
 
 export interface MediaRecorderCaps {
@@ -12,8 +13,23 @@ export interface MediaRecorderCaps {
   h264: boolean
   hwAccel: boolean
   maxChannels: number
-  /** true = browser cannot emit real HEVC; index-only */
   metaOnly: boolean
+  ffmpeg?: boolean
+  mediaRoot?: string
+  ringHot?: boolean
+}
+
+export interface SidecarStatus {
+  recording: boolean
+  ringHot: boolean
+  mediaRoot: string
+  diskBytes: number
+  session: {
+    sessionId: string
+    channels: CameraChannel[]
+    codec_actual: string
+    elapsedMs: number
+  } | null
 }
 
 export interface MediaRecorderStartOpts {
@@ -22,6 +38,7 @@ export interface MediaRecorderStartOpts {
   codec: 'h265' | 'h264'
   segmentDurationSec: number
   bitrates?: Partial<Record<CameraChannel, number>>
+  prerollSec?: number
 }
 
 export interface IMediaRecorder {
@@ -29,11 +46,11 @@ export interface IMediaRecorder {
   start(opts: MediaRecorderStartOpts): Promise<void>
   stop(): Promise<MediaRef[]>
   snapshot(channel: CameraChannel, triggerEventId?: string, label?: string): Promise<MediaRef | null>
-  /** Demo: force a segment marker now */
   tickSegment?(): MediaRef[]
   isActive(): boolean
   getActiveChannels(): CameraChannel[]
   getActualCodec(): MediaCodec
+  clip?(opts: { sessionId: string; channel: CameraChannel; tStartMs: number; tEndMs: number; label?: string }): Promise<MediaRef | null>
 }
 
 const DEFAULT_BITRATES: Record<CameraChannel, number> = {
@@ -48,11 +65,6 @@ const RES: Record<CameraChannel, { w: number; h: number; fps: number }> = {
   IR: { w: 640, h: 512, fps: 30 },
 }
 
-/**
- * Mock / demo recorder: does not encode video.
- * Writes MediaRef entries into archive with codec metadata.
- * Target codec remains h265 for production path documentation.
- */
 export class MockMediaRecorder implements IMediaRecorder {
   private active = false
   private sessionId: string | null = null
@@ -65,26 +77,11 @@ export class MockMediaRecorder implements IMediaRecorder {
   private lastSegAt = 0
 
   getCaps(): MediaRecorderCaps {
-    return {
-      h265: false, // browser HMI cannot reliably encode HEVC
-      h264: false,
-      hwAccel: false,
-      maxChannels: 3,
-      metaOnly: true,
-    }
+    return { h265: false, h264: false, hwAccel: false, maxChannels: 3, metaOnly: true }
   }
-
-  isActive(): boolean {
-    return this.active
-  }
-
-  getActiveChannels(): CameraChannel[] {
-    return [...this.channels]
-  }
-
-  getActualCodec(): MediaCodec {
-    return this.active ? 'meta' : 'meta'
-  }
+  isActive() { return this.active }
+  getActiveChannels() { return [...this.channels] }
+  getActualCodec(): MediaCodec { return 'meta' }
 
   async start(opts: MediaRecorderStartOpts): Promise<void> {
     if (this.active) await this.stop()
@@ -97,10 +94,7 @@ export class MockMediaRecorder implements IMediaRecorder {
     this.segmentIndex = 0
     this.produced = []
     this.lastSegAt = Date.now()
-    // Opening segment markers
-    for (const ch of this.channels) {
-      this.produced.push(this.writeSegment(ch, true))
-    }
+    for (const ch of this.channels) this.produced.push(this.writeSegment(ch, true))
   }
 
   async stop(): Promise<MediaRef[]> {
@@ -112,11 +106,7 @@ export class MockMediaRecorder implements IMediaRecorder {
     return out
   }
 
-  async snapshot(
-    channel: CameraChannel,
-    triggerEventId?: string,
-    label?: string
-  ): Promise<MediaRef | null> {
+  async snapshot(channel: CameraChannel, triggerEventId?: string, label?: string): Promise<MediaRef | null> {
     if (!this.active && !archiveMock.getActiveSessionId()) return null
     const sid = this.sessionId ?? archiveMock.getActiveSessionId()
     if (!sid) return null
@@ -142,33 +132,26 @@ export class MockMediaRecorder implements IMediaRecorder {
   tickSegment(): MediaRef[] {
     if (!this.active || !this.sessionId) return []
     const now = Date.now()
-    // Demo: segment every 10s (faster than production 60s)
     const demoPeriodMs = Math.min(10_000, this.segmentDurationSec * 1000)
     if (now - this.lastSegAt < demoPeriodMs) return []
     this.lastSegAt = now
-    const created: MediaRef[] = []
-    for (const ch of this.channels) {
-      created.push(this.writeSegment(ch, false))
-    }
-    return created
+    return this.channels.map((ch) => this.writeSegment(ch, false))
   }
 
   private writeSegment(channel: CameraChannel, isOpen: boolean): MediaRef {
     const sid = this.sessionId ?? archiveMock.getActiveSessionId() ?? 'unknown'
     const mono = archiveMock.getSessionMonoMs(sid)
     this.segmentIndex += 1
-    const nnnn = String(this.segmentIndex).padStart(4, '0')
     const r = RES[channel]
     const br = this.bitrates[channel] ?? DEFAULT_BITRATES[channel]
-    const label = isOpen
-      ? `SEG ${channel} open · target ${this.targetCodec.toUpperCase()} (demo meta)`
-      : `SEG ${channel} ${nnnn} · target ${this.targetCodec.toUpperCase()} (demo meta)`
     const ref: Omit<MediaRef, 'id' | 'session_id'> = {
       ts_utc: new Date().toISOString(),
       t_mono_ms: mono,
       channel,
       kind: 'SEGMENT',
-      label,
+      label: isOpen
+        ? `SEG ${channel} open · target ${this.targetCodec.toUpperCase()} (demo meta)`
+        : `SEG ${channel} · target ${this.targetCodec.toUpperCase()} (demo meta)`,
       duration_ms: isOpen ? 0 : Math.min(10_000, this.segmentDurationSec * 1000),
       codec: 'meta',
       container: 'mp4',
@@ -179,11 +162,7 @@ export class MockMediaRecorder implements IMediaRecorder {
       hw_encoder: false,
     }
     archiveMock.attachMediaRef(ref)
-    const full = {
-      ...ref,
-      id: `MED-seg-${this.segmentIndex}-${channel}`,
-      session_id: sid,
-    } as MediaRef
+    const full = { ...ref, id: `MED-seg-${this.segmentIndex}-${channel}`, session_id: sid } as MediaRef
     this.produced.push(full)
     return full
   }
@@ -191,23 +170,37 @@ export class MockMediaRecorder implements IMediaRecorder {
 
 export const mediaRecorderMock = new MockMediaRecorder()
 
-/** Suggested production bitrates (kbps) for H.265 */
-export const H265_BITRATE_GUIDE = {
-  LONG: { min: 4000, max: 8000, default: 6000 },
-  WIDE: { min: 2000, max: 4000, default: 3000 },
-  IR: { min: 1000, max: 3000, default: 2000 },
-} as const
-
-/** Default side-car base URL (operator workstation) */
 export const DEFAULT_SIDECAR_URL =
   (typeof import.meta !== 'undefined' &&
     (import.meta as ImportMeta & { env?: Record<string, string> }).env?.VITE_SIDECAR_URL) ||
   'http://127.0.0.1:8787'
 
-/**
- * HTTP client to the FFmpeg media side-car.
- * Real H.265/H.264 segments on operator disk; HMI keeps MediaRef index.
- */
+export function absMediaUrl(url?: string, base: string = DEFAULT_SIDECAR_URL): string | undefined {
+  if (!url) return undefined
+  if (/^https?:/i.test(url)) return url
+  return `${base.replace(/\/$/, '')}${url.startsWith('/') ? url : `/${url}`}`
+}
+
+function ingestRefs(refs: MediaRef[] | undefined, base: string) {
+  if (!refs) return
+  for (const ref of refs) {
+    archiveMock.attachMediaRef({
+      ts_utc: ref.ts_utc,
+      t_mono_ms: ref.t_mono_ms,
+      channel: ref.channel,
+      kind: ref.kind,
+      label: ref.label,
+      codec: ref.codec,
+      container: ref.container,
+      bitrate_kbps: ref.bitrate_kbps,
+      hw_encoder: ref.hw_encoder,
+      url: absMediaUrl(ref.url, base),
+      trigger_event_id: ref.trigger_event_id,
+      duration_ms: ref.duration_ms,
+    })
+  }
+}
+
 export class HttpMediaRecorder implements IMediaRecorder {
   private baseUrl: string
   private active = false
@@ -227,33 +220,24 @@ export class HttpMediaRecorder implements IMediaRecorder {
       body: body ? JSON.stringify(body) : undefined,
     })
     const data = (await res.json()) as T & { ok?: boolean; message?: string }
-    if (!res.ok) {
-      throw new Error((data as { message?: string }).message || `HTTP ${res.status}`)
-    }
+    if (!res.ok) throw new Error((data as { message?: string }).message || `HTTP ${res.status}`)
     return data
   }
 
   getCaps(): MediaRecorderCaps {
-    // Synchronous snapshot — use last probe or conservative defaults.
-    // Prefer probeCaps() at app start.
     return (
       HttpMediaRecorder.cachedCaps ?? {
-        h265: true,
-        h264: true,
-        hwAccel: false,
-        maxChannels: 3,
-        metaOnly: false,
+        h265: true, h264: true, hwAccel: false, maxChannels: 3, metaOnly: false, ffmpeg: true,
       }
     )
   }
 
   static cachedCaps: MediaRecorderCaps | null = null
+  static lastStatus: SidecarStatus | null = null
 
   static async probe(baseUrl: string = DEFAULT_SIDECAR_URL): Promise<MediaRecorderCaps | null> {
     try {
-      const res = await fetch(`${baseUrl.replace(/\/$/, '')}/caps`, {
-        signal: AbortSignal.timeout(2000),
-      })
+      const res = await fetch(`${baseUrl.replace(/\/$/, '')}/caps`, { signal: AbortSignal.timeout(2000) })
       if (!res.ok) return null
       const c = (await res.json()) as MediaRecorderCaps & { ok?: boolean; ffmpeg?: boolean }
       if (c.metaOnly === undefined) c.metaOnly = false
@@ -264,17 +248,21 @@ export class HttpMediaRecorder implements IMediaRecorder {
     }
   }
 
-  isActive(): boolean {
-    return this.active
+  static async fetchStatus(baseUrl: string = DEFAULT_SIDECAR_URL): Promise<SidecarStatus | null> {
+    try {
+      const res = await fetch(`${baseUrl.replace(/\/$/, '')}/status`, { signal: AbortSignal.timeout(2000) })
+      if (!res.ok) return null
+      const s = (await res.json()) as SidecarStatus
+      HttpMediaRecorder.lastStatus = s
+      return s
+    } catch {
+      return null
+    }
   }
 
-  getActiveChannels(): CameraChannel[] {
-    return [...this.channels]
-  }
-
-  getActualCodec(): MediaCodec {
-    return this.actualCodec
-  }
+  isActive() { return this.active }
+  getActiveChannels() { return [...this.channels] }
+  getActualCodec() { return this.actualCodec }
 
   async start(opts: MediaRecorderStartOpts): Promise<void> {
     const data = await this.req<{
@@ -290,6 +278,7 @@ export class HttpMediaRecorder implements IMediaRecorder {
       codec: opts.codec,
       segmentDurationSec: opts.segmentDurationSec,
       bitrates: opts.bitrates,
+      prerollSec: opts.prerollSec,
     })
     if (!data.ok) throw new Error(data.message || 'start failed')
     this.active = true
@@ -297,105 +286,57 @@ export class HttpMediaRecorder implements IMediaRecorder {
     this.channels = data.channels || opts.channels
     this.actualCodec = (data.codec_actual as MediaCodec) || opts.codec
     this.lastRefs = data.refs || []
-    for (const ref of this.lastRefs) {
-      archiveMock.attachMediaRef({
-        ts_utc: ref.ts_utc,
-        t_mono_ms: ref.t_mono_ms,
-        channel: ref.channel,
-        kind: ref.kind,
-        label: ref.label,
-        codec: ref.codec,
-        container: ref.container,
-        bitrate_kbps: ref.bitrate_kbps,
-        hw_encoder: ref.hw_encoder,
-        url: ref.url,
-        trigger_event_id: ref.trigger_event_id,
-        duration_ms: ref.duration_ms,
-      })
-    }
+    ingestRefs(this.lastRefs, this.baseUrl)
   }
 
   async stop(): Promise<MediaRef[]> {
     if (!this.active) return []
-    const data = await this.req<{
-      ok: boolean
-      refs?: MediaRef[]
-    }>('POST', '/record/stop')
+    const data = await this.req<{ ok: boolean; refs?: MediaRef[] }>('POST', '/record/stop')
     this.active = false
     const refs = data.refs || []
-    for (const ref of refs) {
-      archiveMock.attachMediaRef({
-        ts_utc: ref.ts_utc,
-        t_mono_ms: ref.t_mono_ms,
-        channel: ref.channel,
-        kind: ref.kind,
-        label: ref.label,
-        codec: ref.codec,
-        container: ref.container,
-        bitrate_kbps: ref.bitrate_kbps,
-        url: ref.url,
-      })
-    }
+    ingestRefs(refs, this.baseUrl)
     this.lastRefs = refs
     this.sessionId = null
     this.channels = []
     return refs
   }
 
-  async snapshot(
-    channel: CameraChannel,
-    triggerEventId?: string,
-    label?: string
-  ): Promise<MediaRef | null> {
+  async snapshot(channel: CameraChannel, triggerEventId?: string, label?: string): Promise<MediaRef | null> {
     try {
       const data = await this.req<{ ok: boolean; ref?: MediaRef }>('POST', '/snapshot', {
-        channel,
-        triggerEventId,
-        label,
-        sessionId: this.sessionId,
+        channel, triggerEventId, label, sessionId: this.sessionId,
       })
       if (!data.ok || !data.ref) return null
-      const ref = data.ref
-      archiveMock.attachMediaRef({
-        ts_utc: ref.ts_utc,
-        t_mono_ms: ref.t_mono_ms,
-        channel: ref.channel,
-        kind: 'SNAPSHOT',
-        label: ref.label,
-        codec: 'jpeg',
-        container: 'none',
-        url: ref.url,
-        trigger_event_id: triggerEventId,
-      })
-      return ref
+      ingestRefs([data.ref], this.baseUrl)
+      return { ...data.ref, url: absMediaUrl(data.ref.url, this.baseUrl) }
     } catch {
       return null
     }
   }
 
-  /** Side-car segments on its own timer — no HMI tick required */
-  tickSegment(): MediaRef[] {
-    return []
+  async clip(opts: { sessionId: string; channel: CameraChannel; tStartMs: number; tEndMs: number; label?: string }): Promise<MediaRef | null> {
+    try {
+      const data = await this.req<{ ok: boolean; ref?: MediaRef }>('POST', '/clip', opts)
+      if (!data.ok || !data.ref) return null
+      ingestRefs([data.ref], this.baseUrl)
+      return { ...data.ref, url: absMediaUrl(data.ref.url, this.baseUrl) }
+    } catch {
+      return null
+    }
   }
+
+  tickSegment(): MediaRef[] { return [] }
 }
 
 let resolvedRecorder: IMediaRecorder = mediaRecorderMock
-let resolveAttempted = false
 
-/**
- * Prefer side-car when reachable; otherwise MockMediaRecorder (meta demo).
- */
-export async function resolveMediaRecorder(
-  baseUrl: string = DEFAULT_SIDECAR_URL
-): Promise<IMediaRecorder> {
+export async function resolveMediaRecorder(baseUrl: string = DEFAULT_SIDECAR_URL): Promise<IMediaRecorder> {
   const caps = await HttpMediaRecorder.probe(baseUrl)
   if (caps && caps.ffmpeg !== false) {
     resolvedRecorder = new HttpMediaRecorder(baseUrl)
-    resolveAttempted = true
     return resolvedRecorder
   }
   resolvedRecorder = mediaRecorderMock
-  resolveAttempted = true
   return resolvedRecorder
 }
 
@@ -403,5 +344,4 @@ export function getMediaRecorder(): IMediaRecorder {
   return resolvedRecorder
 }
 
-/** @deprecated use getMediaRecorder() after resolveMediaRecorder() */
 export { mediaRecorderMock as defaultRecorder }

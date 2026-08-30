@@ -40,7 +40,7 @@ import {
   mapLegacySource,
   SW_VERSION,
 } from '../adapters/archive'
-import { getMediaRecorder } from '../adapters/mediaRecorder'
+import { getMediaRecorder, HttpMediaRecorder } from '../adapters/mediaRecorder'
 import { getPanoptesController } from '../adapters/panoptes'
 import type { AiBox } from '../adapters/panoptesAi'
 import { setBaseTracking } from '../adapters/panoptesBase'
@@ -85,6 +85,8 @@ interface HmiStore {
   recordingProfile: RecordingProfile
   /** Actual encode mode: meta in demo, h265/h264 in production */
   recordingActualCodec: 'h265' | 'h264' | 'meta'
+  sidecarConnected: boolean
+  mediaRoot: string
   gamepadConnected: boolean
   aiEnabled: boolean
   aiTargets: AiBox[]
@@ -184,6 +186,8 @@ interface HmiStore {
   setRecordingCodec: (c: 'h265' | 'h264') => void
   tickRecordingSegments: () => void
   snapshotRecording: (trigger: string, eventId?: string) => void
+  pollSidecar: () => Promise<void>
+  exportEngagementClip: (sessionId: string, channel?: CameraChannel) => Promise<string | null>
   setGamepadConnected: (v: boolean) => void
   toggleAi: () => void
   setAiLink: (l: 'OFF' | 'CONNECTING' | 'OK' | 'LOST') => void
@@ -447,6 +451,8 @@ export const useHmiStore = create<HmiStore>((set, get) => ({
   recordingChannels: ['LONG', 'IR'],
   recordingProfile: { ...DEFAULT_RECORDING_PROFILE },
   recordingActualCodec: 'meta',
+  sidecarConnected: false,
+  mediaRoot: '',
   gamepadConnected: false,
   aiEnabled: false,
   aiTargets: [],
@@ -466,7 +472,7 @@ export const useHmiStore = create<HmiStore>((set, get) => ({
   layoutProfile: loadLayout(),
   combatChrome: loadChrome(),
   rightDock: 'WEAPON',
-  ringHot: true,
+  ringHot: false,
   mapTrackUp: false,
   toast: null,
   selectedSessionId: null,
@@ -1078,6 +1084,7 @@ export const useHmiStore = create<HmiStore>((set, get) => ({
             codec: profile.codec,
             segmentDurationSec: profile.segmentDurationSec,
             bitrates: profile.bitrates,
+            prerollSec: profile.prerollSec,
           })
           const actual = getMediaRecorder().getActualCodec()
           set({ recordingActualCodec: actual === 'h265' || actual === 'h264' ? actual : 'meta' })
@@ -1092,19 +1099,21 @@ export const useHmiStore = create<HmiStore>((set, get) => ({
               preset: profile.mode,
             }
           )
-          const preroll = (profile.prerollSec ?? 15) * 1000
-          const mono = archiveMock.getSessionMonoMs(sid)
-          for (const ch of channels) {
-            archiveMock.attachMediaRef({
-              ts_utc: new Date().toISOString(),
-              t_mono_ms: Math.max(0, mono - preroll),
-              channel: ch,
-              kind: 'SEGMENT',
-              label: `PREROLL ${ch} −${profile.prerollSec ?? 15}s from ring`,
-              codec: profile.codec,
-              container: 'mp4',
-              duration_ms: preroll,
-            })
+          if (getMediaRecorder().getCaps().metaOnly) {
+            const preroll = (profile.prerollSec ?? 15) * 1000
+            const mono = archiveMock.getSessionMonoMs(sid)
+            for (const ch of channels) {
+              archiveMock.attachMediaRef({
+                ts_utc: new Date().toISOString(),
+                t_mono_ms: Math.max(0, mono - preroll),
+                channel: ch,
+                kind: 'SEGMENT',
+                label: `PREROLL ${ch} −${profile.prerollSec ?? 15}s from ring`,
+                codec: profile.codec,
+                container: 'mp4',
+                duration_ms: preroll,
+              })
+            }
           }
         } catch (e) {
           set({ recording: false, recordingStartedAt: null, recordingActualCodec: 'meta' })
@@ -1214,6 +1223,46 @@ export const useHmiStore = create<HmiStore>((set, get) => ({
     for (const ch of chans.length ? chans : (['LONG'] as CameraChannel[])) {
       void getMediaRecorder().snapshot(ch, eventId, `${trigger} · ${ch}`)
     }
+  },
+
+  pollSidecar: async () => {
+    const st = await HttpMediaRecorder.fetchStatus()
+    if (!st) {
+      set({ sidecarConnected: false, ringHot: getMediaRecorder().getCaps().metaOnly ? get().ringHot : false })
+      return
+    }
+    set({
+      sidecarConnected: true,
+      ringHot: !!st.ringHot,
+      mediaRoot: st.mediaRoot || get().mediaRoot,
+    })
+  },
+
+  exportEngagementClip: async (sessionId, channel = 'LONG') => {
+    const rec = getMediaRecorder()
+    const bundle = archiveMock.getSession(sessionId)
+    const eng = bundle?.engagements[0]
+    const recStart = bundle?.events.find((e) => e.type === 'REC_START')?.t_mono_ms ?? 0
+    const tStart = Math.max(0, recStart - 15_000)
+    const tEnd = eng
+      ? (eng.ended_at
+          ? new Date(eng.ended_at).getTime() - new Date(bundle!.session.started_at).getTime()
+          : tStart + 40_000)
+      : tStart + 40_000
+    if (typeof rec.clip === 'function') {
+      const ref = await rec.clip({
+        sessionId,
+        channel,
+        tStartMs: tStart,
+        tEndMs: tEnd,
+        label: `ENG_T-15_T+25_${channel.toLowerCase()}`,
+      })
+      if (ref?.url) {
+        get().showToast(get().lang === 'ua' ? `Кліп записано: ${ref.label}` : `Clip written: ${ref.label}`, 'ok')
+        return ref.url
+      }
+    }
+    return null
   },
 
   refreshTargetGps: () => {

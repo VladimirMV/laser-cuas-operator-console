@@ -87,12 +87,16 @@ Production target codec: **H.265 (HEVC)**. Browser HMI demo writes **meta index 
 
 ### Layout
 ```
-session_{id}/media/{long|wide|ir}/seg_{nnnn}_t{mono}_h265.mp4
-session_{id}/media/snapshots/{t_mono}_{EVENT}_{channel}.jpg
-session_{id}/media/clips/ENG-{id}_T-15_T+25_long.mp4
-session_{id}/media_index.jsonl
-ring/{long|wide|ir}/          # always-on 90 s fMP4, workstation NVMe, not NAS
+sidecar/media/                                    # mediaRoot (NVMe workstation)
+  ring/{long|wide|ir}/r_00.mp4 … r_14.mp4         # 90 s wrap, always-on
+  {sessionId}/media/{long|wide|ir}/
+    preroll/preroll_{nn}_t{mono}.mp4              # −15 s copy from ring
+    seg_{nnnn}_t{mono}_h265.mp4                   # session take
+  {sessionId}/media/snapshots/{t_mono}_{EVENT}_{ch}.jpg
+  {sessionId}/media/clips/ENG-…_T-15_T+25_{ch}.mp4
+  {sessionId}/media_index.jsonl
 ```
+Start: `npm run sidecar` or `start-sidecar.ps1`. HMI REC talks to http://127.0.0.1:8787.
 
 On `/record/stop` the sidecar **renames** FFmpeg `seg_%04d_h265.mp4` to `seg_{nnnn}_t{idx * segmentDurationSec * 1000}_h265.mp4` and writes those names into `media_index.jsonl`.
 
