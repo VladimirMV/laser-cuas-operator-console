@@ -5,11 +5,36 @@
 https://github.com/VladimirMV/laser-cuas-operator-console
 
 ## Local run
+
 ```bash
 npm install
 npm run dev
 ```
-http://localhost:5173
+
+Open the URL Vite prints (default port 5173).
+
+### Windows (WDAC / Smart App Control)
+
+If `npm run dev` fails with `Cannot find module @rollup/rollup-win32-x64-msvc` or **Application Control policy has blocked this file**, the zip was marked as internet-downloaded and Windows blocked native addons.
+
+In PowerShell **from the project folder** (the one that contains `package.json`):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup-win.ps1
+```
+
+Or by hand:
+
+```powershell
+Get-ChildItem -Recurse | Unblock-File
+Remove-Item -Recurse -Force node_modules, package-lock.json -ErrorAction SilentlyContinue
+npm install
+npm run dev
+```
+
+This tree uses **WASM Rollup / esbuild** (`overrides` in `package.json`) so WDAC does not need to allow `*.node` / `esbuild.exe`. Prefer **Node 22 LTS** over Node 24 if anything else breaks.
+
+Do not run `npm i` in the parent unzip folder — `package.json` must be in the current directory.
 
 ## Web demo (GitHub Pages)
 After Actions succeeds:
