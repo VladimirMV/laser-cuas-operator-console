@@ -1,0 +1,7 @@
+node_modules
+sidecar/node_modules
+sidecar/media
+.git
+*.zip
+**/*.md
+!README.md

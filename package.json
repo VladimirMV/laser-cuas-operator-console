@@ -9,7 +9,9 @@
     "build": "vite build",
     "preview": "vite preview",
     "start": "node serve-dist.mjs",
-    "sidecar": "node sidecar/server.mjs"
+    "sidecar": "node sidecar/server.mjs",
+    "docker:up": "docker compose up --build",
+    "docker:down": "docker compose down"
   },
   "dependencies": {
     "clsx": "^2.1.1",

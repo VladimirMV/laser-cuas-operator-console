@@ -6,6 +6,16 @@ https://github.com/VladimirMV/laser-cuas-operator-console
 
 ## Local run
 
+**Windows (recommended): Docker Desktop**, then `start-docker.cmd` (or `docker compose up --build`).
+
+- HMI http://127.0.0.1:5173 · sidecar http://127.0.0.1:8787/status
+- Recordings: `sidecar\media` on the host disk
+- Live cameras: copy `.env.docker.example` → `.env` and set `STREAM_*`
+
+This avoids WDAC (blocked `*.node`) and does not need a host FFmpeg.
+
+Without Docker:
+
 ```bash
 npm install
 npm run dev

@@ -1,0 +1,57 @@
+# Laser C-UAS operator workstation
+# HMI SPA + FFmpeg media sidecar. Recordings land on the host disk.
+#
+#   docker compose up --build
+#   HMI:     http://127.0.0.1:5173
+#   sidecar: http://127.0.0.1:8787/status
+#   files:   ./sidecar/media
+#
+# Live cameras: copy .env.docker.example → .env and set STREAM_* to RTSP/MJPEG.
+
+name: laser-cuas
+
+services:
+  sidecar:
+    build:
+      context: .
+      dockerfile: docker/sidecar.Dockerfile
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./sidecar/media:/data/media
+      - ./sidecar/config.json:/app/config.json:ro
+    environment:
+      SIDECAR_HOST: "0.0.0.0"
+      SIDECAR_PORT: "8787"
+      MEDIA_ROOT: /data/media
+      FFMPEG_PATH: /usr/bin/ffmpeg
+      STREAM_LONG: ${STREAM_LONG:-testsrc}
+      STREAM_WIDE: ${STREAM_WIDE:-testsrc}
+      STREAM_IR: ${STREAM_IR:-testsrc}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "panoptes.local:host-gateway"
+      - "panoptes-base.local:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8787/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  hmi:
+    build:
+      context: .
+      dockerfile: docker/hmi.Dockerfile
+    ports:
+      - "5173:80"
+    depends_on:
+      sidecar:
+        condition: service_healthy
+    restart: unless-stopped

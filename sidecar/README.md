@@ -4,6 +4,10 @@
 
 ## Запуск
 
+С рабочей станции: `docker compose up --build` из корня (sidecar + HMI, FFmpeg в контейнере, файлы на диске хоста в `./media`).
+
+Без Docker:
+
 ```bash
 cd sidecar
 npm install          # optional: ffmpeg-static if system ffmpeg missing

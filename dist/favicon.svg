@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <rect width="32" height="32" fill="#0A0C10"/>
+  <circle cx="16" cy="16" r="13" fill="none" stroke="#00E5FF" stroke-width="2.5"/>
+  <!-- broken cross -->
+  <rect x="14.5" y="4" width="3" height="8" rx="1" fill="#00E5FF"/>
+  <rect x="14.5" y="20" width="3" height="8" rx="1" fill="#00E5FF"/>
+  <rect x="4" y="14.5" width="8" height="3" rx="1" fill="#00E5FF"/>
+  <rect x="20" y="14.5" width="8" height="3" rx="1" fill="#00E5FF"/>
+  <!-- bright orange center — oversized for small-size readability -->
+  <circle cx="16" cy="16" r="3.2" fill="#FF5014"/>
+  <circle cx="16" cy="16" r="1.6" fill="#FF2800"/>
+</svg>
