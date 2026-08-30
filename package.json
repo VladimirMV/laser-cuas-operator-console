@@ -1,9 +1,9 @@
 {
   "name": "laser-cuas-operator-interface",
   "private": true,
-  "version": "1.4.8",
+  "version": "1.8.0",
   "type": "module",
-  "description": "Laser C-UAS HMI v1.4.8 — Operator Console demo",
+  "description": "Laser C-UAS HMI v1.8.0 — Operator Console · Archive Replay + HUD",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "vite build",
