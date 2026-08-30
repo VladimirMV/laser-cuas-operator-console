@@ -11,14 +11,15 @@ export function AiOverlay() {
 
   return (
     <div className="absolute inset-0 pointer-events-none z-[15]">
-      {/* 640 crop zone */}
+      {/* 640×640 NN crop — square, always viewport-centered */}
       <div
         className="absolute border border-dashed border-[#00E5FF]/40 bg-[#00E5FF]/5"
         style={{
-          left: `${((1920 - 640) / 2 / 1920) * 100}%`,
-          top: `${((1080 - 640) / 2 / 1080) * 100}%`,
-          width: `${(640 / 1920) * 100}%`,
-          height: `${(640 / 1080) * 100}%`,
+          left: '50%',
+          top: '50%',
+          width: 'min(36%, 56%)',
+          aspectRatio: '1 / 1',
+          transform: 'translate(-50%, -50%)',
         }}
       />
       {boxes.map((b) => {

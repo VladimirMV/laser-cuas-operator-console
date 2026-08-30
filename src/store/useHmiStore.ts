@@ -245,8 +245,8 @@ const initialTarget: TargetData = {
   trackQuality: 94,
   trackState: 'TRACKING',
   coastTimer: 0,
-  posX: 52,
-  posY: 44,
+  posX: 50,
+  posY: 50,
 }
 
 const defaultParallax: ParallaxCoeffs = {

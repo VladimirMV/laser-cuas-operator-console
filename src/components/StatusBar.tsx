@@ -1,10 +1,112 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Shield, Crosshair, Settings2, Maximize2, Minimize2, Clock, Languages, Circle, MapPin, LayoutDashboard } from 'lucide-react'
+import { Shield, Crosshair, Settings2, Maximize2, Minimize2, Clock, Languages, Circle, MapPin, Columns2 } from 'lucide-react'
 import { useHmiStore } from '../store/useHmiStore'
 import { useT } from '../i18n/useT'
 import { cn } from '../lib/utils'
 import { formatCoord } from '../lib/geo'
 import { collectHealthIssues, foldSystemStatus, interlocksOk } from '../lib/systemHealth'
+import type { RightDockTab } from '../types/hmi'
+
+const DOCK_TABS: { id: RightDockTab; key: 'dockCam' | 'dockWeapon' | 'dockC2' | 'dockSys' }[] = [
+  { id: 'CAM', key: 'dockCam' },
+  { id: 'WEAPON', key: 'dockWeapon' },
+  { id: 'C2', key: 'dockC2' },
+  { id: 'SYS', key: 'dockSys' },
+]
+
+function DockSetup() {
+  const { t } = useT()
+  const combatChrome = useHmiStore((s) => s.combatChrome)
+  const setCombatChrome = useHmiStore((s) => s.setCombatChrome)
+  const rightDock = useHmiStore((s) => s.rightDock)
+  const setRightDock = useHmiStore((s) => s.setRightDock)
+  const rightPanelCollapsed = useHmiStore((s) => s.rightPanelCollapsed)
+  const toggleRightPanel = useHmiStore((s) => s.toggleRightPanel)
+  const [open, setOpen] = useState(false)
+
+  useEffect(() => {
+    if (!open) return
+    const onDoc = (e: MouseEvent) => {
+      const el = e.target as HTMLElement | null
+      if (el?.closest('[data-dock-setup]')) return
+      setOpen(false)
+    }
+    document.addEventListener('mousedown', onDoc)
+    return () => document.removeEventListener('mousedown', onDoc)
+  }, [open])
+
+  return (
+    <div className="relative shrink-0" data-dock-setup>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        title={t('dockSetupTitle')}
+        className={cn(
+          'flex items-center gap-1 px-1.5 py-0.5 rounded border text-[9px] font-mono font-bold',
+          open
+            ? 'border-[#58A6FF] text-[#58A6FF] bg-[#58A6FF]/10'
+            : 'border-[#30363D] text-[#8B949E] hover:border-[#58A6FF] hover:text-[#58A6FF]'
+        )}
+      >
+        <Columns2 size={11} />
+        {t('dockSetup')}
+      </button>
+      {open && (
+        <div className="absolute left-0 top-full z-50 mt-1 w-52 rounded border border-[#30363D] bg-[#161B22] p-2 shadow-xl">
+          <div className="mb-1 text-[9px] font-mono tracking-wider text-[#6E7681]">{t('dockLayout')}</div>
+          <div className="mb-2 grid grid-cols-2 gap-1">
+            {(['hud', 'stack'] as const).map((c) => (
+              <button
+                key={c}
+                type="button"
+                onClick={() => setCombatChrome(c)}
+                className={cn(
+                  'py-1 rounded border text-[10px] font-mono font-bold',
+                  combatChrome === c
+                    ? 'border-[#58A6FF] bg-[#58A6FF]/10 text-[#58A6FF]'
+                    : 'border-[#30363D] text-[#8B949E] hover:border-[#8B949E]'
+                )}
+              >
+                {c === 'hud' ? t('combatHud') : t('combatStack')}
+              </button>
+            ))}
+          </div>
+          <div className="mb-1 text-[9px] font-mono tracking-wider text-[#6E7681]">{t('dockPanel')}</div>
+          <div className="mb-2 grid grid-cols-2 gap-1">
+            {DOCK_TABS.map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                disabled={combatChrome === 'stack'}
+                onClick={() => {
+                  setCombatChrome('hud')
+                  setRightDock(tab.id)
+                  if (rightPanelCollapsed) toggleRightPanel()
+                }}
+                className={cn(
+                  'py-1 rounded border text-[10px] font-mono font-bold',
+                  combatChrome === 'stack' && 'opacity-40',
+                  rightDock === tab.id && combatChrome === 'hud'
+                    ? 'border-[#58A6FF] bg-[#58A6FF]/10 text-[#58A6FF]'
+                    : 'border-[#30363D] text-[#8B949E] hover:border-[#8B949E]'
+                )}
+              >
+                {t(tab.key)}
+              </button>
+            ))}
+          </div>
+          <button
+            type="button"
+            onClick={() => toggleRightPanel()}
+            className="w-full py-1 rounded border border-[#30363D] text-[10px] font-mono text-[#8B949E] hover:border-[#8B949E]"
+          >
+            {rightPanelCollapsed ? t('panelExpand') : t('panelCollapse')}
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
 
 export function StatusBar() {
   const {
@@ -14,7 +116,7 @@ export function StatusBar() {
     gamepadConnected, turretLink, platform, laserTelemetry,
     toggleHelp,
     biteItems,
-    combatChrome, setCombatChrome, ringHot, setRecChannel, sidecarConnected, mediaRoot,
+    ringHot, setRecChannel, sidecarConnected, mediaRoot,
   } = useHmiStore()
   const { t, lang } = useT()
   const [time, setTime] = useState('')
@@ -73,6 +175,16 @@ export function StatusBar() {
   return (
     <div className="h-11 flex items-center justify-between px-3 bg-[#161B22] border-b border-[#30363D] select-none shrink-0 gap-2">
       <div className="flex items-center gap-2.5 min-w-0 overflow-hidden">
+        <div className="flex items-center gap-2 pr-2.5 mr-0.5 border-r border-[#30363D] shrink-0">
+          <div className="grid h-7 w-7 place-items-center rounded-sm border border-[#58A6FF]/45 bg-[#0D1117] shadow-[inset_0_0_8px_rgba(88,166,255,0.12)]">
+            <Crosshair size={13} className="text-[#58A6FF]" />
+          </div>
+          <div className="leading-none select-none">
+            <div className="text-[11px] font-bold tracking-[0.16em] text-[#E6EDF3]">{t('brand')}</div>
+            <div className="mt-0.5 text-[8px] font-mono tracking-[0.28em] text-[#58A6FF]/75">{t('brandSub')}</div>
+          </div>
+        </div>
+        <DockSetup />
         <div className="flex items-center gap-1.5" title={sysTitle}>
           <Shield size={14} className={sysCls} />
           <span className="text-[10px] text-[#8B949E]">{t('sys')}</span>
@@ -215,15 +327,6 @@ export function StatusBar() {
       </div>
 
       <div className="flex items-center gap-3 shrink-0">
-        <button
-          type="button"
-          onClick={() => setCombatChrome(combatChrome === 'hud' ? 'stack' : 'hud')}
-          title={combatChrome === 'hud' ? t('combatStack') : t('combatHud')}
-          className="flex items-center gap-1 px-1.5 py-0.5 rounded border border-[#30363D] text-[9px] font-mono font-bold text-[#8B949E] hover:border-[#58A6FF] hover:text-[#58A6FF]"
-        >
-          <LayoutDashboard size={12} />
-          {combatChrome === 'hud' ? t('combatHud') : t('combatStack')}
-        </button>
         <button
           type="button"
           onClick={requestService}

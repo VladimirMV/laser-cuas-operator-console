@@ -191,18 +191,18 @@ export function MainVideo() {
       </AnimatePresence>
 
       {target && target.trackState !== 'SEARCH' && target.trackState !== 'LOST' && (() => {
-        const box = Math.max(8, Math.min(28, 18000 / Math.max(range, 1)))
-        const boxH = box * 1.4
+        const box = Math.max(8, Math.min(22, 18000 / Math.max(range, 1)))
         const cx = target.posX ?? 50
         const cy = target.posY ?? 50
         return (
           <div
             className="absolute pointer-events-none z-10"
             style={{
-              left: `${cx - box / 2}%`,
-              top: `${cy - boxH / 2}%`,
+              left: `${cx}%`,
+              top: `${cy}%`,
               width: `${box}%`,
-              height: `${boxH}%`,
+              aspectRatio: '1 / 1',
+              transform: 'translate(-50%, -50%)',
               borderWidth: 2,
               borderStyle: target.trackState === 'COAST' ? 'dashed' : 'solid',
               borderColor: trackColor,
