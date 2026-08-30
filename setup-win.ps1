@@ -1,5 +1,5 @@
 # Windows: zip from the internet has Mark of the Web; WDAC/Smart App Control
-# then blocks Rollup/esbuild native *.node / *.exe. Strip MOTW, fresh install, WASM rollup.
+# then blocks Rollup native *.node. Strip MOTW, fresh install, start Vite.
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
@@ -14,8 +14,11 @@ if (Test-Path package-lock.json) {
   Write-Host 'Removing package-lock.json (was built on Linux)...'
   Remove-Item -Force package-lock.json
 }
+if (Test-Path node_modules\.vite) {
+  Remove-Item -Recurse -Force node_modules\.vite
+}
 
-Write-Host 'npm install (Rollup/esbuild via WASM — no native .node)...'
+Write-Host 'npm install (Rollup via WASM — no native .node)...'
 npm install
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
