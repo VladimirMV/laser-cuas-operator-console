@@ -263,16 +263,24 @@ function pullJpegs(hub, chunk) {
       break
     }
     if (soi > 0) hub.buf = hub.buf.slice(soi)
+    const nextSoi = hub.buf.indexOf(JPEG_SOI, 2)
     const eoi = hub.buf.indexOf(JPEG_EOI, 2)
-    if (eoi < 0) {
-      if (hub.buf.length > 8 * 1024 * 1024) {
-        console.warn(`[sidecar] live hub ${hub.ch} jpeg overflow, reset`)
+    let end = -1
+    if (eoi >= 0 && (nextSoi < 0 || eoi + 2 <= nextSoi)) end = eoi + 2
+    else if (nextSoi > 0) end = nextSoi
+    if (end < 0) {
+      if (hub.buf.length > 12 * 1024 * 1024) {
+        console.warn(`[sidecar] live hub ${hub.ch} jpeg overflow ${hub.buf.length}B, reset`)
         hub.buf = Buffer.alloc(0)
       }
       break
     }
-    out.push(hub.buf.slice(0, eoi + 2))
-    hub.buf = hub.buf.slice(eoi + 2)
+    let jpeg = hub.buf.slice(0, end)
+    hub.buf = hub.buf.slice(end)
+    if (jpeg[jpeg.length - 2] !== 0xff || jpeg[jpeg.length - 1] !== 0xd9) {
+      jpeg = Buffer.concat([jpeg, JPEG_EOI])
+    }
+    if (jpeg.length > 512) out.push(jpeg)
   }
   return out
 }
@@ -280,7 +288,7 @@ function pullJpegs(hub, chunk) {
 function writeFrame(client, jpeg) {
   const res = client.res
   if (!res.writable || res.destroyed) return false
-  if (res.writableNeedDrain || (typeof res.writableLength === 'number' && res.writableLength > 1024 * 1024)) {
+  if (res.writableNeedDrain && typeof res.writableLength === 'number' && res.writableLength > 8 * 1024 * 1024) {
     client.skipped++
     return true
   }
@@ -328,7 +336,9 @@ function ensureLiveHub(ch) {
   const connect = () => {
     if (liveHubs[ch] !== hub || hub.dead) return
     try {
-      const req = http.get(cam, { headers: { Accept: '*/*', Connection: 'keep-alive' } }, (inc) => {
+      const req = http.get(cam, {
+        headers: { Accept: '*/*', Connection: 'keep-alive', 'User-Agent': 'Laser-CUAS-sidecar/1.8.1' },
+      }, (inc) => {
         if (liveHubs[ch] !== hub) { inc.destroy(); return }
         req.setTimeout(0)
         inc.setTimeout(0)
@@ -344,6 +354,10 @@ function ensureLiveHub(ch) {
               for (const fn of hub.pending.splice(0)) {
                 try { fn() } catch { /* */ }
               }
+            }
+            hub.n = (hub.n || 0) + 1
+            if (hub.n === 1 || hub.n % 40 === 0) {
+              console.log(`[sidecar] live hub ${ch} #${hub.n} ${jpeg.length}B clients=${hub.clients.size}`)
             }
             broadcastJpeg(hub, jpeg)
           }
@@ -1210,12 +1224,26 @@ const server = http.createServer(async (req, res) => {
     }
     if (method === 'GET' && url.pathname.startsWith('/live/')) {
       const rest = url.pathname.slice('/live/'.length)
-      const raw = /\.mjpeg$/i.test(rest) || url.searchParams.get('raw') === '1'
       const ch = rest.split('.')[0].toUpperCase()
       if (!CHANNELS.includes(ch) || ch === 'WIDE') {
         res.writeHead(404, CORS)
         return res.end('no such channel')
       }
+      if (/\.jpe?g$/i.test(rest)) {
+        const hub = ensureLiveHub(ch)
+        if (!hub || !hub.lastJpeg) {
+          res.writeHead(503, { ...CORS, 'Retry-After': '1' })
+          return res.end('no frame yet')
+        }
+        res.writeHead(200, {
+          ...CORS,
+          'Content-Type': 'image/jpeg',
+          'Cache-Control': 'no-store, no-cache',
+          'Content-Length': hub.lastJpeg.length,
+        })
+        return res.end(hub.lastJpeg)
+      }
+      const raw = /\.mjpeg$/i.test(rest) || url.searchParams.get('raw') === '1'
       return attachLive(ch, req, res, raw)
     }
     if (method === 'GET' && url.pathname === '/caps') return json(res, 200, getCaps())
