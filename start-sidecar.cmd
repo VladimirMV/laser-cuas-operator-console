@@ -1,10 +1,12 @@
 @echo off
 cd /d "%~dp0sidecar"
+title Laser C-UAS sidecar
 if not exist node_modules (
-  echo Installing sidecar dependencies...
-  call npm install
+  echo npm install...
+  call npm install --omit=dev --no-audit --no-fund
 )
-echo mediaRoot will be %CD%\media
-echo Need FFmpeg in PATH:  winget install Gyan.FFmpeg
-call npm start
+if exist "%CD%\node_modules\ffmpeg-static\ffmpeg.exe" set "FFMPEG_PATH=%CD%\node_modules\ffmpeg-static\ffmpeg.exe"
+echo mediaRoot=%CD%\media
+echo FFMPEG_PATH=%FFMPEG_PATH%
+node server.mjs
 pause

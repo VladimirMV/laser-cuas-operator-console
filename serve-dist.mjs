@@ -51,6 +51,15 @@ http
       res.end(data)
     })
   })
+  .on('error', (err) => {
+    if (err && err.code === 'EADDRINUSE') {
+      console.error('Port ' + port + ' busy. Close the other HMI window or run:')
+      console.error('  set PORT=5174&& node serve-dist.mjs')
+      process.exit(1)
+    }
+    console.error(err)
+    process.exit(1)
+  })
   .listen(port, host, () => {
-    console.log(`Laser C-UAS HMI 1.8.0  http://${host}:${port}`)
+    console.log('Laser C-UAS HMI  http://' + host + ':' + port)
   })
