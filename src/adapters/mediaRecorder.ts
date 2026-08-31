@@ -248,6 +248,20 @@ export class HttpMediaRecorder implements IMediaRecorder {
     }
   }
 
+  static async discover(baseUrl: string = DEFAULT_SIDECAR_URL, scan = false): Promise<boolean> {
+    try {
+      const res = await fetch(`${baseUrl.replace(/\/$/, '')}/discover`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scan }),
+        signal: AbortSignal.timeout(8000),
+      })
+      return res.ok
+    } catch {
+      return false
+    }
+  }
+
   static async fetchStatus(baseUrl: string = DEFAULT_SIDECAR_URL): Promise<SidecarStatus | null> {
     try {
       const res = await fetch(`${baseUrl.replace(/\/$/, '')}/status`, { signal: AbortSignal.timeout(2000) })

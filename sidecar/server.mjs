@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 import { promisify } from 'node:util'
 import { resolveUrlHost } from './mdns.mjs'
+import { discoverPanoptes } from './discover.mjs'
 
 const execFileAsync = promisify(execFile)
 const require = createRequire(import.meta.url)
@@ -92,31 +93,36 @@ function pickEncoder(codec) {
   return null
 }
 
+const FORCE_TESTSRC = process.env.FORCE_TESTSRC === '1'
+const BUILTIN_STREAMS = {
+  LONG: 'http://panoptes-base.local/2k-stream',
+  IR: 'http://panoptes.local/thermal/stream',
+  WIDE: '',
+}
+
 function channelKind(ch) {
   const cfg = config.channels?.[ch] || {}
-  if ((cfg.kind || '').toLowerCase() === 'none') return 'none'
-  const envVal = (process.env[`STREAM_${ch}`] || '').trim()
-  const primary = envVal || (cfg.url || '').trim()
-  if (!primary || primary === 'testsrc') {
-    if ((cfg.kind || '').toLowerCase() === 'testsrc' || primary === 'testsrc' || envVal === 'testsrc') return 'testsrc'
-    return (cfg.labUrl || '').trim() ? 'file' : 'none'
-  }
-  if (primary.startsWith('rtsp://')) return 'rtsp'
-  if (/\.(mp4|mkv|mov|m3u8|ts)(\?|$)/i.test(primary)) return 'file'
-  if (/^https?:/i.test(primary)) return (cfg.kind || 'mjpeg').toLowerCase()
-  return 'testsrc'
+  if ((cfg.kind || '').toLowerCase() === 'none' && ch === 'WIDE') return 'none'
+  if (FORCE_TESTSRC) return 'testsrc'
+  const url = channelUrl(ch)
+  if (!url) return 'none'
+  if (url.startsWith('rtsp://')) return 'rtsp'
+  if (/\.(mp4|mkv|mov|m3u8|ts)(\?|$)/i.test(url)) return 'file'
+  if (/^https?:/i.test(url)) return 'mjpeg'
+  return 'none'
 }
 
 function channelUrl(ch) {
   const envVal = (process.env[`STREAM_${ch}`] || '').trim()
   const cfg = config.channels?.[ch] || {}
-  if ((cfg.kind || '').toLowerCase() === 'none' && !envVal) return ''
+  if (ch === 'WIDE' && (cfg.kind || '').toLowerCase() === 'none' && !envVal) return ''
+  if (FORCE_TESTSRC) return ''
   if (envVal && envVal !== 'testsrc') return envVal
-  if (envVal === 'testsrc') return ''
   const primary = (cfg.url || '').trim()
-  if (primary === 'testsrc') return ''
-  if (primary) return primary
-  return (cfg.labUrl || cfg.fallback || '').trim()
+  if (primary && primary !== 'testsrc') return primary
+  const fb = (cfg.fallback || '').trim()
+  if (fb && fb !== 'testsrc') return fb
+  return BUILTIN_STREAMS[ch] || ''
 }
 
 function sessionDir(sessionId) {
@@ -141,7 +147,11 @@ function geometry(ch) {
 
 const resolvedUrls = Object.create(null)
 
-async function resolveChannelUrls() {
+function stillMdns(url) {
+  return Boolean(url && /\.local([:/]|$)/i.test(url))
+}
+
+async function resolveChannelUrls({ scan = false } = {}) {
   for (const ch of CHANNELS) {
     const url = channelUrl(ch)
     if (!url) {
@@ -150,11 +160,25 @@ async function resolveChannelUrls() {
     }
     const next = await resolveUrlHost(url)
     resolvedUrls[ch] = next
-    if (next !== url) console.log(`[sidecar] resolved ${ch}: ${url} → ${next}`)
-    else if (/\.local[:/\s]/i.test(url) || /\.local$/i.test(url.split('/')[2] || '')) {
-      console.warn(`[sidecar] ${ch}: could not resolve ${url} (Windows mDNS). ffmpeg will likely fail.`)
-    }
+    if (next !== url) console.log(`[sidecar] DNS ${ch}: ${url} → ${next}`)
   }
+  const need = CHANNELS.filter((ch) => ch !== 'WIDE' && stillMdns(liveUrl(ch)))
+  if (!need.length) return resolvedUrls
+  console.log(`[sidecar] ${need.join(',')} still *.local — ARP/HTTP discover scan=${scan}`)
+  try {
+    const found = await discoverPanoptes({ scan })
+    if (found.LONG && stillMdns(liveUrl('LONG'))) {
+      resolvedUrls.LONG = found.LONG
+      console.log(`[sidecar] ARP LONG → ${found.LONG}`)
+    }
+    if (found.IR && stillMdns(liveUrl('IR'))) {
+      resolvedUrls.IR = found.IR
+      console.log(`[sidecar] ARP IR → ${found.IR}`)
+    }
+  } catch (e) {
+    console.warn('[sidecar] discover failed', e.message || e)
+  }
+  return resolvedUrls
 }
 
 function liveUrl(ch) {
@@ -166,15 +190,15 @@ function inputArgs(ch) {
   const url = liveUrl(ch)
   const kind = channelKind(ch)
   const g = geometry(ch)
-  if (kind === 'none' || (!url && kind !== 'testsrc')) {
-    return { args: null, fromUrl: null, kind: 'none' }
-  }
-  if (!url || kind === 'testsrc') {
-    return {
-      args: ['-f', 'lavfi', '-i', `testsrc=size=${g.size}:rate=${g.fps}`],
-      fromUrl: null,
-      kind: 'testsrc',
+  if (kind === 'none' || !url) {
+    if (FORCE_TESTSRC) {
+      return {
+        args: ['-f', 'lavfi', '-i', `testsrc=size=${g.size}:rate=${g.fps}`],
+        fromUrl: null,
+        kind: 'testsrc',
+      }
     }
+    return { args: null, fromUrl: null, kind: 'none' }
   }
   if (kind === 'rtsp') {
     return { args: ['-rtsp_transport', 'tcp', '-i', url], fromUrl: url, kind }
@@ -232,6 +256,28 @@ function spawnLogged(bin, args, tag) {
 const ringProcs = {}
 let ringHot = false
 
+function stopRing() {
+  for (const ch of CHANNELS) {
+    try { ringProcs[ch]?.kill('SIGKILL') } catch { /* */ }
+    delete ringProcs[ch]
+  }
+  ringHot = false
+}
+
+async function refreshAndRing({ scan = false } = {}) {
+  await resolveChannelUrls({ scan })
+  const ready = CHANNELS.filter((ch) => ch !== 'WIDE' && liveUrl(ch) && !stillMdns(liveUrl(ch)))
+  if (!ready.length) {
+    console.warn('[sidecar] camera IP not found yet — ring idle. Keep HMI open (ARP) or set IP in config.json')
+    return false
+  }
+  const already = ready.every((ch) => ringProcs[ch] && ringProcs[ch].exitCode == null)
+  if (already && ringHot) return true
+  stopRing()
+  startRing()
+  return ringHot
+}
+
 function startRing() {
   const enc = pickEncoder('h264') || pickEncoder('h265')
   if (!ffmpegInfo.ok || !enc) {
@@ -246,6 +292,14 @@ function startRing() {
     const { args: inArgs, fromUrl, kind } = inputArgs(ch)
     if (!inArgs) {
       console.log(`[sidecar] ring ${ch} skipped (not fitted)`)
+      continue
+    }
+    if (fromUrl && stillMdns(fromUrl)) {
+      console.log(`[sidecar] ring ${ch} waiting for IP (${fromUrl})`)
+      continue
+    }
+    if (kind === 'testsrc' && !FORCE_TESTSRC) {
+      console.log(`[sidecar] ring ${ch} refused testsrc`)
       continue
     }
     const gop = RING_SEG * geometry(ch).fps
@@ -412,7 +466,8 @@ function diskBytes() {
 async function handleStart(body) {
   if (recording) return { ok: false, message: 'Already recording', sessionId: recording.sessionId }
   if (!ffmpegInfo.ok) return { ok: false, message: 'FFmpeg not available on side-car host' }
-  await resolveChannelUrls()
+  await resolveChannelUrls({ scan: true })
+  if (!ringHot) startRing()
 
   const sessionId = String(body.sessionId || `SES-${Date.now()}`)
   let channels = Array.isArray(body.channels) ? body.channels.map(String) : ['LONG', 'IR']
@@ -788,6 +843,7 @@ const server = http.createServer(async (req, res) => {
               elapsedMs: Date.now() - recording.startedAt,
             }
           : null,
+        streams: Object.fromEntries(CHANNELS.map((ch) => [ch, liveUrl(ch) || null])),
         ring: Object.fromEntries(
           CHANNELS.map((ch) => [ch, { files: listRingFiles(ch).length, dir: ringDir(ch) }])
         ),
@@ -795,6 +851,11 @@ const server = http.createServer(async (req, res) => {
     }
     if (method === 'GET' && url.pathname === '/sessions') {
       return json(res, 200, { ok: true, mediaRoot: MEDIA_ROOT, sessions: listSessions() })
+    }
+    if (method === 'POST' && url.pathname === '/discover') {
+      const body = await readBody(req).catch(() => ({}))
+      const ok = await refreshAndRing({ scan: Boolean(body && body.scan) })
+      return json(res, 200, { ok, ringHot, streams: Object.fromEntries(CHANNELS.map((ch) => [ch, liveUrl(ch) || null])) })
     }
     if (method === 'POST' && url.pathname === '/record/start') {
       const result = await handleStart(await readBody(req))
@@ -871,10 +932,12 @@ server.listen(PORT, HOST, () => {
   for (const ch of CHANNELS) {
     console.log(`[sidecar] ${ch}: ${channelUrl(ch) || channelKind(ch)}`)
   }
-  resolveChannelUrls().then(() => {
-    startRing()
-    const live = CHANNELS.filter((c) => ringProcs[c])
-    ringHot = live.length > 0 && live.every((ch) => ringProcs[ch] && ringProcs[ch].exitCode == null)
-    console.log(`[sidecar] ringHot=${ringHot}  ${RING_SEG}s × ${RING_WRAP} = ${RING_SEG * RING_WRAP}s`)
-  }).catch((e) => console.error('[sidecar] resolve/ring', e))
+  void refreshAndRing({ scan: false }).then((ok) => {
+    console.log(`[sidecar] ringHot=${ringHot} started=${ok}`)
+  })
+  setInterval(() => {
+    if (!ringHot && !FORCE_TESTSRC) {
+      void refreshAndRing({ scan: false })
+    }
+  }, 8000)
 })

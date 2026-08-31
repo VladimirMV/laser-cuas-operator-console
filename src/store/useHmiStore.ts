@@ -1231,6 +1231,11 @@ export const useHmiStore = create<HmiStore>((set, get) => ({
       set({ sidecarConnected: false, ringHot: getMediaRecorder().getCaps().metaOnly ? get().ringHot : false })
       return
     }
+    const streams = (st as { streams?: Record<string, string | null> }).streams || {}
+    const mdns = Object.values(streams).some((u) => typeof u === 'string' && u.includes('.local'))
+    if (!st.ringHot || mdns) {
+      await HttpMediaRecorder.discover(undefined, false)
+    }
     set({
       sidecarConnected: true,
       ringHot: !!st.ringHot,
