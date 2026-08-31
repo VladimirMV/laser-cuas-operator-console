@@ -924,46 +924,37 @@ export const useHmiStore = create<HmiStore>((set, get) => ({
 
   dropTrack: (source = 'UI') => {
     const t = get().target
-    if (!t || t.trackState === 'LOST' || t.trackState === 'SEARCH') return
+    if (!t || (t.trackState !== 'TRACKING' && t.trackState !== 'COAST')) return
     if (get().laserStatus === 'FIRING') get().fireEnd(source)
     set({
       laserStatus: 'SAFE',
       armConfirm: false,
-      automation: 'TRACKING',
+      automation: 'SEARCHING',
       aiActiveId: null,
       target: {
         ...t,
-        trackState: 'LOST',
+        trackState: 'SEARCH',
         trackQuality: 0,
         coastTimer: 0,
         omegaAz: 0,
         omegaEl: 0,
       },
     })
-    get().ensureArchiveSession()
-    get().snapshotRecording('TRACK_LOST')
     get().logEvent('TRACK_LOST', 'Track dropped by operator', source, {
       az: t.azimuth,
       el: t.elevation,
     })
     get().showToast(
-      get().lang === 'ua' ? 'Трекінг скинуто' : 'Tracking dropped',
-      'warn'
+      get().lang === 'ua' ? 'Трекінг скинуто (RB)' : 'Tracking dropped (RB)',
+      'info'
     )
   },
 
   toggleTrackAtAim: (source = 'UI') => {
     const st = get()
     const t = st.target
-    const locked = Boolean(
-      (t && (t.trackState === 'TRACKING' || t.trackState === 'COAST'))
-      || st.aiTracking
-      || st.aiActiveId
-    )
-    if (locked) {
+    if (t && (t.trackState === 'TRACKING' || t.trackState === 'COAST')) {
       get().dropTrack(source)
-      void get().stopAiDetect()
-      set({ aiTargets: [], aiActiveId: null, aiTracking: false })
       return
     }
     const boxes = st.aiTargets
@@ -974,7 +965,6 @@ export const useHmiStore = create<HmiStore>((set, get) => ({
         return da - db
       })[0]
       get().selectAiBox(nearest.id)
-      set({ aiTracking: true })
       get().showToast(
         st.lang === 'ua' ? `Захват ШІ ${nearest.type || nearest.id}` : `AI lock ${nearest.type || nearest.id}`,
         'ok'

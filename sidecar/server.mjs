@@ -44,40 +44,88 @@ function ffPath(p) {
   return p.replace(/\\/g, '/')
 }
 
-function resolveFfmpegBin() {
-  const env = (process.env.FFMPEG_PATH || '').trim()
-  if (env && fs.existsSync(env)) return env
-  const configured = (config.ffmpegPath || '').trim()
-  if (configured && configured !== 'ffmpeg' && fs.existsSync(configured)) return configured
-  try {
-    const packed = require('ffmpeg-static')
-    if (packed && fs.existsSync(packed)) return packed
-  } catch {
-    /* optional */
-  }
-  return configured || 'ffmpeg'
-}
-
 function probeFfmpeg(bin) {
   try {
     const out = execFileSync(bin, ['-hide_banner', '-encoders'], {
       encoding: 'utf8',
       maxBuffer: 2 * 1024 * 1024,
+      windowsHide: true,
     })
+    const h264 = /libx264|h264_nvenc|mpeg4|libopenh264/.test(out)
+    const h265 = /libx265|hevc_nvenc|hevc_qsv|hevc_vaapi/.test(out)
     return {
-      ok: true,
+      ok: h264 || h265 || /mpeg4/.test(out),
       bin,
-      h265: /libx265|hevc_nvenc|hevc_qsv|hevc_vaapi/.test(out),
-      h264: /libx264|h264_nvenc/.test(out),
+      h265,
+      h264: h264 || /mpeg4/.test(out),
       hwAccel: /hevc_nvenc|hevc_qsv|hevc_vaapi|h264_nvenc/.test(out),
     }
-  } catch {
-    return { ok: false, bin, h265: false, h264: false, hwAccel: false }
+  } catch (e) {
+    return { ok: false, bin, h265: false, h264: false, hwAccel: false, error: e.message }
   }
 }
 
-const ffmpegBin = resolveFfmpegBin()
-const ffmpegInfo = probeFfmpeg(ffmpegBin)
+function ffmpegCandidates() {
+  const list = []
+  const add = (p) => {
+    if (!p || typeof p !== 'string') return
+    const s = p.trim()
+    if (!s || list.includes(s)) return
+    list.push(s)
+  }
+  add(process.env.FFMPEG_PATH)
+  add(config.ffmpegPath)
+  try {
+    const packed = require('ffmpeg-static')
+    add(packed)
+  } catch { /* optional */ }
+  add(path.join(__dirname, 'ffmpeg.exe'))
+  add(path.join(__dirname, 'bin', 'ffmpeg.exe'))
+  const local = process.env.LOCALAPPDATA || ''
+  const home = process.env.USERPROFILE || ''
+  const extras = [
+    path.join(local, 'Microsoft', 'WinGet', 'Links', 'ffmpeg.exe'),
+    'C:\\ffmpeg\\bin\\ffmpeg.exe',
+    'C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe',
+    'C:\\Program Files\\Gyan\\FFmpeg\\bin\\ffmpeg.exe',
+    path.join(home, 'scoop', 'shims', 'ffmpeg.exe'),
+    path.join(home, 'AppData', 'Local', 'Microsoft', 'WinGet', 'Links', 'ffmpeg.exe'),
+  ]
+  extras.forEach(add)
+  try {
+    const w = execFileSync(process.platform === 'win32' ? 'where' : 'which', ['ffmpeg'], {
+      encoding: 'utf8',
+      windowsHide: true,
+    })
+    for (const line of String(w).split(/\r?\n/)) add(line.trim())
+  } catch { /* not on PATH */ }
+  add('ffmpeg')
+  add('ffmpeg.exe')
+  return list
+}
+
+let ffmpegBin = 'ffmpeg'
+let ffmpegInfo = { ok: false, bin: 'ffmpeg', h265: false, h264: false, hwAccel: false }
+
+function refreshFfmpeg() {
+  if (ffmpegInfo.ok && ffmpegInfo.h264) return true
+  for (const bin of ffmpegCandidates()) {
+    const exists = bin === 'ffmpeg' || bin === 'ffmpeg.exe' || fs.existsSync(bin)
+    if (!exists) continue
+    const info = probeFfmpeg(bin)
+    if (info.ok) {
+      ffmpegBin = bin
+      ffmpegInfo = info
+      console.log(`[sidecar] ffmpeg OK  ${bin}  h264=${info.h264} h265=${info.h265}`)
+      return true
+    }
+    console.warn(`[sidecar] ffmpeg miss  ${bin}  ${info.error || 'no encoder'}`)
+  }
+  console.warn('[sidecar] ffmpeg not found. Install: winget install Gyan.FFmpeg   or   cd sidecar && npm i ffmpeg-static')
+  return false
+}
+
+refreshFfmpeg()
 
 function pickEncoder(codec) {
   const preferHw = !!config.preferHw
@@ -90,7 +138,7 @@ function pickEncoder(codec) {
   }
   if (ffmpegInfo.h264) return { enc: 'libx264', codecName: 'h264', hw: false }
   if (ffmpegInfo.h265) return { enc: 'libx265', codecName: 'h265', hw: false }
-  return null
+  return { enc: 'mpeg4', codecName: 'h264', hw: false }
 }
 
 const FORCE_TESTSRC = process.env.FORCE_TESTSRC === '1'
@@ -274,7 +322,6 @@ async function refreshAndRing({ scan = false } = {}) {
   const already = ready.every((ch) => ringProcs[ch] && ringProcs[ch].exitCode == null)
   if (already && ringHot) return true
   stopRing()
-  wipeRing()
   startRing()
   if (ringHot) startLiveHarvest()
   return ringHot
@@ -294,9 +341,10 @@ function wipeRing() {
 }
 
 function startRing() {
+  refreshFfmpeg()
   const enc = pickEncoder('h264') || pickEncoder('h265')
   if (!ffmpegInfo.ok || !enc) {
-    console.warn('[sidecar] ring not started — FFmpeg encoder missing')
+    console.warn('[sidecar] ring not started — FFmpeg encoder missing (see ffmpeg miss lines above)')
     ringHot = false
     return
   }
@@ -572,7 +620,7 @@ function diskBytes() {
 
 async function handleStart(body) {
   if (recording) return { ok: false, message: 'Already recording', sessionId: recording.sessionId }
-  if (!ffmpegInfo.ok) return { ok: false, message: 'FFmpeg not available on side-car host' }
+  if (!refreshFfmpeg()) return { ok: false, message: 'FFmpeg not available on side-car host. winget install Gyan.FFmpeg' }
   await resolveChannelUrls({ scan: true })
   if (!ringHot) startRing()
 
@@ -1079,6 +1127,7 @@ server.listen(PORT, HOST, () => {
   for (const ch of CHANNELS) {
     console.log(`[sidecar] ${ch}: ${channelUrl(ch) || channelKind(ch)}`)
   }
+  wipeRing()
   void refreshAndRing({ scan: false }).then((ok) => {
     console.log(`[sidecar] ringHot=${ringHot} started=${ok}`)
   })

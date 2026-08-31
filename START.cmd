@@ -12,7 +12,25 @@ if not exist sidecar\node_modules (
   echo Installing sidecar deps...
   pushd sidecar
   call npm install --omit=dev
+  call npm install ffmpeg-static --no-save
   popd
+)
+
+if not exist sidecar\node_modules\ffmpeg-static\ffmpeg.exe if not exist sidecar\node_modules\ffmpeg-static\ffmpeg (
+  echo Installing ffmpeg-static for recording...
+  pushd sidecar
+  call npm install ffmpeg-static --no-save
+  popd
+)
+
+set "FFMPEG_PATH="
+if exist sidecar\node_modules\ffmpeg-static\ffmpeg.exe set "FFMPEG_PATH=%CD%\sidecar\node_modules\ffmpeg-static\ffmpeg.exe"
+if exist sidecar\node_modules\ffmpeg-static\ffmpeg set "FFMPEG_PATH=%CD%\sidecar\node_modules\ffmpeg-static\ffmpeg"
+for /f "delims=" %%i in ('where ffmpeg 2^>nul') do if not defined FFMPEG_PATH set "FFMPEG_PATH=%%i"
+if defined FFMPEG_PATH (
+  echo Using ffmpeg: %FFMPEG_PATH%
+) else (
+  echo WARNING: ffmpeg not on PATH. Recording needs:  winget install Gyan.FFmpeg
 )
 
 if not exist dist\index.html (
@@ -21,7 +39,7 @@ if not exist dist\index.html (
   exit /b 1
 )
 
-start "Laser C-UAS sidecar" cmd /k "cd /d "%~dp0sidecar" && node server.mjs"
+start "Laser C-UAS sidecar" cmd /k "cd /d "%~dp0sidecar" && set FFMPEG_PATH=%FFMPEG_PATH% && node server.mjs"
 
 echo Waiting for sidecar...
 powershell -NoProfile -Command "for($i=0;$i -lt 40;$i++){ try { Invoke-WebRequest http://127.0.0.1:8787/health -UseBasicParsing | Out-Null; exit 0 } catch { Start-Sleep -Seconds 1 } }; exit 1"
