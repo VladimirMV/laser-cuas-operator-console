@@ -1,5 +1,5 @@
 /**
- * Unified player: HLS (demo) | JPEG poll from sidecar | MJPEG img | placeholder
+ * HLS | sidecar JPEG poll | MJPEG img | placeholder
  */
 import { useEffect, useState } from 'react'
 import { HlsPlayer } from './HlsPlayer'
@@ -21,19 +21,16 @@ function sidecarSnapUrl(url: string): string | null {
   return `${m[1]}${m[2].toUpperCase()}.jpg`
 }
 
-/** Poll last JPEG from sidecar — reliable for 2K LONG (Chrome multipart often dies). */
 function JpegPoll({
   url,
   className,
   thermalStyle,
   zoom,
-  onFail,
 }: {
   url: string
   className?: string
   thermalStyle?: boolean
   zoom: number
-  onFail: () => void
 }) {
   const [src, setSrc] = useState<string | null>(null)
   const z = Math.max(1, zoom || 1)
@@ -41,31 +38,30 @@ function JpegPoll({
   useEffect(() => {
     let stop = false
     let obj: string | null = null
-    let fails = 0
     const tick = async () => {
       if (stop) return
       try {
         const r = await fetch(`${url}?t=${Date.now()}`, { cache: 'no-store' })
-        if (!r.ok) throw new Error(String(r.status))
-        const blob = await r.blob()
-        if (blob.size < 256) throw new Error('empty')
-        const next = URL.createObjectURL(blob)
-        if (obj) URL.revokeObjectURL(obj)
-        obj = next
-        setSrc(next)
-        fails = 0
+        if (r.ok) {
+          const blob = await r.blob()
+          if (blob.size >= 256) {
+            const next = URL.createObjectURL(blob)
+            if (obj) URL.revokeObjectURL(obj)
+            obj = next
+            setSrc(next)
+          }
+        }
       } catch {
-        fails += 1
-        if (fails >= 25) onFail()
+        /* sidecar not ready yet — keep polling */
       }
-      if (!stop) window.setTimeout(tick, 90)
+      if (!stop) window.setTimeout(tick, 120)
     }
     void tick()
     return () => {
       stop = true
       if (obj) URL.revokeObjectURL(obj)
     }
-  }, [url, onFail])
+  }, [url])
 
   return (
     <div className={cn('absolute inset-0 bg-black', className)}>
@@ -78,7 +74,7 @@ function JpegPoll({
         />
       ) : (
         <div className="absolute inset-0 flex items-center justify-center font-mono text-[10px] text-[#6E7681]">
-          WAITING LONG/IR…
+          WAITING CAMERA…
         </div>
       )}
     </div>
@@ -133,19 +129,8 @@ export function StreamPlayer({
     )
   }
 
-  if (snap && !failed) {
-    return (
-      <JpegPoll
-        url={snap}
-        className={className}
-        thermalStyle={thermalStyle}
-        zoom={z}
-        onFail={() => {
-          if (fallbackUrl && fallbackUrl !== src) setSrc(fallbackUrl)
-          else setFailed(true)
-        }}
-      />
-    )
+  if (snap) {
+    return <JpegPoll url={snap} className={className} thermalStyle={thermalStyle} zoom={z} />
   }
 
   return (

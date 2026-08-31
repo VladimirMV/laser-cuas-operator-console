@@ -3,7 +3,7 @@
   "port": 8787,
   "mediaRoot": "./media",
   "corsOrigin": "*",
-  "defaultCodec": "h265",
+  "defaultCodec": "h264",
   "segmentDurationSec": 15,
   "prerollSec": 15,
   "ringSegmentSec": 6,
@@ -15,10 +15,10 @@
   },
   "channels": {
     "LONG": {
-      "url": "http://panoptes-base.local/2k-stream",
-      "fallback": "http://panoptes.local/2k-stream",
+      "url": "http://192.168.80.238/2k-stream",
+      "fallback": "http://panoptes-base.local/2k-stream",
       "kind": "mjpeg",
-      "comment": "Same MJPEG the HMI shows. Override with env STREAM_LONG."
+      "comment": "Pinned IP from a working session. .local only if this IP is dead."
     },
     "WIDE": {
       "url": "",
@@ -26,7 +26,8 @@
       "comment": "Not fitted on this turret — do not record a lab pattern."
     },
     "IR": {
-      "url": "http://panoptes.local/thermal/stream",
+      "url": "http://192.168.80.243/thermal/stream",
+      "fallback": "http://panoptes.local/thermal/stream",
       "kind": "mjpeg"
     }
   },

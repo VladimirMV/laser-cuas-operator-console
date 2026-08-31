@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 import { promisify } from 'node:util'
 import { resolveUrlHost } from './mdns.mjs'
-import { discoverPanoptes } from './discover.mjs'
+import { discoverPanoptes, probeUrl } from './discover.mjs'
 
 const execFileAsync = promisify(execFile)
 const require = createRequire(import.meta.url)
@@ -201,27 +201,46 @@ function stillMdns(url) {
 
 async function resolveChannelUrls({ scan = false } = {}) {
   for (const ch of CHANNELS) {
-    const url = channelUrl(ch)
-    if (!url) {
-      resolvedUrls[ch] = ''
-      continue
+    const cfg = config.channels?.[ch] || {}
+    const envVal = (process.env[`STREAM_${ch}`] || '').trim()
+    const candidates = [
+      envVal && envVal !== 'testsrc' ? envVal : '',
+      (cfg.url || '').trim(),
+      (cfg.fallback || '').trim(),
+    ].filter((u, i, a) => u && u !== 'testsrc' && a.indexOf(u) === i)
+
+    let chosen = ''
+    for (const raw of candidates) {
+      const next = await resolveUrlHost(raw)
+      if (stillMdns(next)) {
+        console.log(`[sidecar] ${ch} DNS pending ${next}`)
+        continue
+      }
+      const hit = await probeUrl(next)
+      if (hit && hit.score >= 30) {
+        chosen = next
+        console.log(`[sidecar] ${ch} OK score=${hit.score} ${next}`)
+        break
+      }
+      console.log(`[sidecar] ${ch} skip ${next} (not a live stream)`)
     }
-    const next = await resolveUrlHost(url)
-    resolvedUrls[ch] = next
-    if (next !== url) console.log(`[sidecar] DNS ${ch}: ${url} → ${next}`)
+    resolvedUrls[ch] = chosen
   }
-  const need = CHANNELS.filter((ch) => ch !== 'WIDE' && stillMdns(liveUrl(ch)))
+
+  const need = CHANNELS.filter((ch) => ch !== 'WIDE' && !liveUrl(ch))
   if (!need.length) return resolvedUrls
-  console.log(`[sidecar] ${need.join(',')} still *.local — ARP/HTTP discover scan=${scan}`)
+  console.log(`[sidecar] ${need.join(',')} unresolved — ARP discover scan=${scan}`)
   try {
     const found = await discoverPanoptes({ scan })
-    if (found.LONG && stillMdns(liveUrl('LONG'))) {
-      resolvedUrls.LONG = found.LONG
-      console.log(`[sidecar] ARP LONG → ${found.LONG}`)
-    }
-    if (found.IR && stillMdns(liveUrl('IR'))) {
-      resolvedUrls.IR = found.IR
-      console.log(`[sidecar] ARP IR → ${found.IR}`)
+    for (const ch of ['LONG', 'IR']) {
+      if (!need.includes(ch) || !found[ch]) continue
+      const hit = await probeUrl(found[ch])
+      if (hit && hit.score >= 30) {
+        resolvedUrls[ch] = found[ch]
+        console.log(`[sidecar] ARP ${ch} → ${found[ch]} score=${hit.score}`)
+      } else {
+        console.log(`[sidecar] ARP ${ch} rejected ${found[ch]}`)
+      }
     }
   } catch (e) {
     console.warn('[sidecar] discover failed', e.message || e)

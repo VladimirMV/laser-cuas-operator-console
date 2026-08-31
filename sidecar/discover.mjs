@@ -1,6 +1,6 @@
 /**
- * Find Panoptes cameras on the LAN without mDNS.
- * Chrome already resolved *.local; Windows ARP then has their IPs.
+ * Find Panoptes cameras. Never pick a random LAN host that answers 200 on /video.
+ * Score: JPEG/multipart body, exact paths, 192.168.80.x. Reject HTML and tiny replies.
  */
 import os from 'node:os'
 import http from 'node:http'
@@ -9,8 +9,9 @@ import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
 
-const LONG_PATHS = ['/2k-stream', '/stream', '/mjpeg', '/video']
-const IR_PATHS = ['/thermal/stream', '/thermal', '/ir-stream', '/ir']
+const LONG_PATHS = ['/2k-stream', '/stream']
+const IR_PATHS = ['/thermal/stream', '/thermal']
+const PREFER_PREFIX = '192.168.80.'
 
 function parseIps(text) {
   const ips = new Set()
@@ -52,8 +53,29 @@ function localSubnets() {
   return nets
 }
 
-function probe(ip, pathName, timeoutMs = 800) {
+function scoreHead({ ip, pathName, ct, cl, status, head }) {
+  if (status < 200 || status >= 400) return 0
+  if (cl > 0 && cl < 2048) return 0
+  const latin = head.toString('latin1')
+  if (/<!doctype|<html|not found|404/i.test(latin)) return 0
+  const jpeg = head.length >= 2 && head[0] === 0xff && head[1] === 0xd8
+  const multi = latin.startsWith('--')
+  const h264 = head.length >= 4 && head[0] === 0 && head[1] === 0 && (head[2] === 0 || head[2] === 1)
+  let s = 0
+  if (jpeg) s += 60
+  if (multi) s += 50
+  if (h264) s += 20
+  if (/mjpeg|multipart|image\/jpeg/i.test(ct)) s += 25
+  else if (/octet-stream|video\//i.test(ct)) s += 10
+  if (pathName === '/2k-stream' || pathName === '/thermal/stream') s += 35
+  if (ip.startsWith(PREFER_PREFIX)) s += 40
+  return s
+}
+
+export function probeUrl(url, timeoutMs = 1800) {
   return new Promise((resolve) => {
+    let u
+    try { u = new URL(url) } catch { return resolve(null) }
     let done = false
     const finish = (v) => {
       if (done) return
@@ -62,50 +84,56 @@ function probe(ip, pathName, timeoutMs = 800) {
     }
     const req = http.get(
       {
-        host: ip,
-        path: pathName,
+        hostname: u.hostname,
+        port: u.port || 80,
+        path: u.pathname + u.search,
         timeout: timeoutMs,
-        headers: { Connection: 'close', Accept: '*/*' },
+        headers: { Connection: 'close', Accept: '*/*', 'User-Agent': 'Laser-CUAS-sidecar/1.8.1' },
       },
       (res) => {
-        const ct = String(res.headers['content-type'] || '')
-        try { res.destroy() } catch { /* */ }
-        if (res.statusCode >= 200 && res.statusCode < 400) finish({ ip, path: pathName, ct })
-        else finish(null)
+        const chunks = []
+        const take = (c) => {
+          chunks.push(c)
+          if (Buffer.concat(chunks).length >= 80) {
+            try { res.destroy() } catch { /* */ }
+          }
+        }
+        res.on('data', take)
+        const wrap = () => {
+          const head = Buffer.concat(chunks)
+          const row = {
+            ip: u.hostname,
+            pathName: u.pathname,
+            ct: String(res.headers['content-type'] || ''),
+            cl: Number(res.headers['content-length'] || 0),
+            status: res.statusCode,
+            head,
+          }
+          const score = scoreHead(row)
+          if (score < 30) return finish(null)
+          finish({
+            url: `${u.protocol}//${u.hostname}${u.port ? ':' + u.port : ''}${u.pathname}`,
+            ip: u.hostname,
+            path: u.pathname,
+            ct: row.ct,
+            score,
+            cl: row.cl,
+          })
+        }
+        res.on('end', wrap)
+        res.on('close', wrap)
       }
     )
-    req.on('timeout', () => {
-      req.destroy()
-      finish(null)
-    })
+    req.on('timeout', () => { req.destroy(); finish(null) })
     req.on('error', () => finish(null))
   })
 }
 
-async function firstHit(ips, paths, already) {
-  const batch = 20
-  for (let i = 0; i < ips.length; i += batch) {
-    const slice = ips.slice(i, i + batch)
-    const jobs = slice.flatMap((ip) =>
-      paths.map(async (p) => {
-        if (already.url) return null
-        const r = await probe(ip, p)
-        return r
-      })
-    )
-    const results = await Promise.all(jobs)
-    const hit = results.find(Boolean)
-    if (hit) {
-      already.url = `http://${hit.ip}${hit.path}`
-      already.ip = hit.ip
-      return already
-    }
-  }
-  return already
+function probe(ip, pathName, timeoutMs = 1800) {
+  return probeUrl(`http://${ip}${pathName}`, timeoutMs)
 }
 
 export async function discoverPanoptes({ scan = false } = {}) {
-  const found = { LONG: { url: null, ip: null }, IR: { url: null, ip: null } }
   let ips = await arpIps()
   if (scan || ips.length < 2) {
     const extra = []
@@ -114,12 +142,30 @@ export async function discoverPanoptes({ scan = false } = {}) {
     }
     ips = [...new Set([...ips, ...extra])]
   }
-  await firstHit(ips, LONG_PATHS, found.LONG)
-  await firstHit(ips, IR_PATHS, found.IR)
-  return {
-    LONG: found.LONG.url,
-    IR: found.IR.url,
-    ips: ips.length,
-    scanned: scan || ips.length > 30,
+  ips.sort((a, b) => {
+    const ap = a.startsWith(PREFER_PREFIX) ? 0 : 1
+    const bp = b.startsWith(PREFER_PREFIX) ? 0 : 1
+    return ap - bp || a.localeCompare(b, undefined, { numeric: true })
+  })
+
+  async function best(paths) {
+    let winner = null
+    const batch = 12
+    for (let i = 0; i < ips.length; i += batch) {
+      const slice = ips.slice(i, i + batch)
+      const jobs = slice.flatMap((ip) => paths.map((p) => probe(ip, p)))
+      const results = (await Promise.all(jobs)).filter(Boolean)
+      for (const r of results) {
+        if (!winner || r.score > winner.score) winner = r
+      }
+      if (winner && winner.score >= 80 && winner.ip.startsWith(PREFER_PREFIX)) break
+    }
+    return winner
   }
+
+  const long = await best(LONG_PATHS)
+  const ir = await best(IR_PATHS)
+  if (long) console.log(`[sidecar] discover LONG score=${long.score} ${long.url} ct=${long.ct}`)
+  if (ir) console.log(`[sidecar] discover IR score=${ir.score} ${ir.url} ct=${ir.ct}`)
+  return { LONG: long?.url || null, IR: ir?.url || null, ips: ips.length }
 }
