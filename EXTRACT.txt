@@ -1,0 +1,10 @@
+EXTRACT THIS ZIP before running.
+
+1. Right-click Laser_CUAS_HMI_v1.8.1_RealRecord.zip
+2. Extract All  ->  Desktop
+3. Open folder Laser_CUAS_HMI_v1.8.1_RealRecord
+4. Double-click START.cmd
+5. Keep the black window open
+
+Do NOT double-click START.cmd inside the zip.
+Do NOT run from C:\Users\...\AppData\Local\Temp\...
