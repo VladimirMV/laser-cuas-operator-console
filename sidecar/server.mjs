@@ -235,18 +235,72 @@ function liveUrl(ch) {
 }
 
 
-/** One TCP to each camera; fan-out MJPEG to HMI + ffmpeg ring. */
+/** One TCP per camera. Split into complete JPEGs, fan-out frames (never mid-frame). */
 const liveHubs = {}
+const JPEG_SOI = Buffer.from([0xff, 0xd8])
+const JPEG_EOI = Buffer.from([0xff, 0xd9])
 
 function stopLiveHub(ch) {
   const h = liveHubs[ch]
   if (!h) return
+  h.dead = true
+  if (h.timer) clearTimeout(h.timer)
   try { h.upstream?.destroy() } catch { /* */ }
   try { h.req?.destroy() } catch { /* */ }
   for (const c of h.clients) {
-    try { c.end() } catch { /* */ }
+    try { c.res.end() } catch { /* */ }
   }
   delete liveHubs[ch]
+}
+
+function pullJpegs(hub, chunk) {
+  hub.buf = hub.buf.length ? Buffer.concat([hub.buf, chunk]) : Buffer.from(chunk)
+  const out = []
+  while (hub.buf.length >= 4) {
+    const soi = hub.buf.indexOf(JPEG_SOI)
+    if (soi < 0) {
+      hub.buf = hub.buf.slice(-1)
+      break
+    }
+    if (soi > 0) hub.buf = hub.buf.slice(soi)
+    const eoi = hub.buf.indexOf(JPEG_EOI, 2)
+    if (eoi < 0) {
+      if (hub.buf.length > 8 * 1024 * 1024) {
+        console.warn(`[sidecar] live hub ${hub.ch} jpeg overflow, reset`)
+        hub.buf = Buffer.alloc(0)
+      }
+      break
+    }
+    out.push(hub.buf.slice(0, eoi + 2))
+    hub.buf = hub.buf.slice(eoi + 2)
+  }
+  return out
+}
+
+function writeFrame(client, jpeg) {
+  const res = client.res
+  if (!res.writable || res.destroyed) return false
+  if (res.writableNeedDrain || (typeof res.writableLength === 'number' && res.writableLength > 1024 * 1024)) {
+    client.skipped++
+    return true
+  }
+  if (client.raw) {
+    return res.write(jpeg)
+  }
+  res.write('--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ' + jpeg.length + '\r\n\r\n')
+  res.write(jpeg)
+  return res.write('\r\n')
+}
+
+function broadcastJpeg(hub, jpeg) {
+  hub.lastJpeg = jpeg
+  for (const client of [...hub.clients]) {
+    try {
+      if (!writeFrame(client, jpeg)) hub.clients.delete(client)
+    } catch {
+      hub.clients.delete(client)
+    }
+  }
 }
 
 function ensureLiveHub(ch) {
@@ -257,88 +311,93 @@ function ensureLiveHub(ch) {
   if (existing) stopLiveHub(ch)
 
   const hub = {
+    ch,
     cam,
     clients: new Set(),
     pending: [],
     ready: false,
     dead: false,
-    contentType: 'multipart/x-mixed-replace;boundary=frame',
+    buf: Buffer.alloc(0),
+    lastJpeg: null,
     upstream: null,
     req: null,
+    timer: null,
   }
   liveHubs[ch] = hub
 
   const connect = () => {
-    if (liveHubs[ch] !== hub) return
+    if (liveHubs[ch] !== hub || hub.dead) return
     try {
       const req = http.get(cam, { headers: { Accept: '*/*', Connection: 'keep-alive' } }, (inc) => {
+        if (liveHubs[ch] !== hub) { inc.destroy(); return }
         req.setTimeout(0)
         inc.setTimeout(0)
         hub.upstream = inc
-        hub.contentType = inc.headers['content-type'] || hub.contentType
-        hub.ready = true
-        console.log(`[sidecar] live hub ${ch} ← ${cam}  (${hub.contentType})`)
-        for (const fn of hub.pending.splice(0)) {
-          try { fn() } catch { /* */ }
-        }
+        hub.buf = Buffer.alloc(0)
+        console.log(`[sidecar] live hub ${ch} connected ← ${cam}`)
         inc.on('data', (chunk) => {
-          for (const c of [...hub.clients]) {
-            if (!c.writable || c.destroyed) {
-              hub.clients.delete(c)
-              continue
+          const frames = pullJpegs(hub, chunk)
+          for (const jpeg of frames) {
+            if (!hub.ready) {
+              hub.ready = true
+              console.log(`[sidecar] live hub ${ch} first jpeg ${jpeg.length}B`)
+              for (const fn of hub.pending.splice(0)) {
+                try { fn() } catch { /* */ }
+              }
             }
-            try {
-              if (c.writableNeedDrain) continue
-              c.write(chunk)
-            } catch {
-              hub.clients.delete(c)
-            }
+            broadcastJpeg(hub, jpeg)
           }
         })
         inc.on('end', () => {
           hub.ready = false
           hub.upstream = null
-          setTimeout(connect, 800)
+          hub.timer = setTimeout(connect, 600)
         })
         inc.on('error', () => {
           hub.ready = false
           hub.upstream = null
-          setTimeout(connect, 1200)
+          hub.timer = setTimeout(connect, 1000)
         })
       })
       hub.req = req
       req.on('error', (e) => {
         console.warn(`[sidecar] live hub ${ch} ${e.message}`)
         hub.ready = false
-        setTimeout(connect, 1500)
+        hub.timer = setTimeout(connect, 1500)
       })
     } catch (e) {
       console.warn(`[sidecar] live hub ${ch} ${e.message}`)
-      setTimeout(connect, 1500)
+      hub.timer = setTimeout(connect, 1500)
     }
   }
   connect()
   return hub
 }
 
-function attachLive(ch, req, res) {
+function attachLive(ch, req, res, raw) {
   const hub = ensureLiveHub(ch)
   if (!hub) {
     res.writeHead(503, CORS)
     return res.end('camera not resolved')
   }
+  const client = { res, raw: !!raw, skipped: 0 }
   const send = () => {
     if (res.writableEnded || res.destroyed) return
     res.writeHead(200, {
       ...CORS,
-      'Content-Type': hub.contentType,
+      'Content-Type': raw
+        ? 'application/octet-stream'
+        : 'multipart/x-mixed-replace; boundary=frame',
       'Cache-Control': 'no-store, no-cache',
       Pragma: 'no-cache',
       Connection: 'keep-alive',
     })
-    hub.clients.add(res)
+    hub.clients.add(client)
+    if (hub.lastJpeg) {
+      try { writeFrame(client, hub.lastJpeg) } catch { /* */ }
+    }
   }
-  req.on('close', () => hub.clients.delete(res))
+  req.on('close', () => hub.clients.delete(client))
   if (hub.ready) send()
   else hub.pending.push(send)
 }
@@ -467,11 +526,12 @@ function startRing() {
     const pattern = ffPath(path.join(dir, 'r_%02d.mp4'))
     ensureLiveHub(ch)
     const src = inputArgs(ch)
-    const localLive = `http://127.0.0.1:${PORT}/live/${ch}`
+    const localLive = `http://127.0.0.1:${PORT}/live/${ch}.mjpeg`
     const fromUrl = src.fromUrl
     const kind = src.kind
     const inArgs = (src.kind === 'mjpeg' && src.args)
       ? [
+          '-f', 'mjpeg',
           '-reconnect', '1',
           '-reconnect_streamed', '1',
           '-reconnect_delay_max', '4',
@@ -816,11 +876,12 @@ async function handleStart(body) {
     const outFile = ffPath(path.join(outDir, `rec_live_${encoder.codecName}.mp4`))
     ensureLiveHub(ch)
     const src = inputArgs(ch)
-    const localLive = `http://127.0.0.1:${PORT}/live/${ch}`
+    const localLive = `http://127.0.0.1:${PORT}/live/${ch}.mjpeg`
     const fromUrl = src.fromUrl
     const kind = src.kind
     const inArgs = (src.kind === 'mjpeg' && src.args)
       ? [
+          '-f', 'mjpeg',
           '-reconnect', '1',
           '-reconnect_streamed', '1',
           '-reconnect_delay_max', '4',
@@ -1148,12 +1209,14 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, service: 'laser-cuas-media-sidecar', version: '1.8.1', ffmpeg: ffmpegInfo.ok, ringHot })
     }
     if (method === 'GET' && url.pathname.startsWith('/live/')) {
-      const ch = url.pathname.slice('/live/'.length).split('.')[0].toUpperCase()
+      const rest = url.pathname.slice('/live/'.length)
+      const raw = /\.mjpeg$/i.test(rest) || url.searchParams.get('raw') === '1'
+      const ch = rest.split('.')[0].toUpperCase()
       if (!CHANNELS.includes(ch) || ch === 'WIDE') {
         res.writeHead(404, CORS)
         return res.end('no such channel')
       }
-      return attachLive(ch, req, res)
+      return attachLive(ch, req, res, raw)
     }
     if (method === 'GET' && url.pathname === '/caps') return json(res, 200, getCaps())
     if (method === 'GET' && url.pathname === '/status') {
