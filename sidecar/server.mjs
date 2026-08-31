@@ -234,6 +234,21 @@ function liveUrl(ch) {
   return channelUrl(ch)
 }
 
+function previewDir() {
+  return path.join(MEDIA_ROOT, 'preview')
+}
+function previewFile(ch) {
+  return path.join(previewDir(), ch.toLowerCase() + '.jpg')
+}
+function readPreviewJpeg(ch) {
+  const f = previewFile(ch)
+  try {
+    const buf = fs.readFileSync(f)
+    if (buf.length > 800 && buf[0] === 0xff && buf[1] === 0xd8) return buf
+  } catch { /* not yet */ }
+  return liveHubs[ch] && liveHubs[ch].lastJpeg ? liveHubs[ch].lastJpeg : null
+}
+
 
 /** One TCP per camera. Split into complete JPEGs, fan-out frames (never mid-frame). */
 const liveHubs = {}
@@ -497,9 +512,6 @@ function stopRing() {
 
 async function refreshAndRing({ scan = false } = {}) {
   await resolveChannelUrls({ scan })
-  for (const ch of CHANNELS) {
-    if (ch !== 'WIDE' && liveUrl(ch) && !stillMdns(liveUrl(ch))) ensureLiveHub(ch)
-  }
   const ready = CHANNELS.filter((ch) => ch !== 'WIDE' && liveUrl(ch) && !stillMdns(liveUrl(ch)))
   if (!ready.length) {
     console.warn('[sidecar] camera IP not found yet — ring idle. Keep HMI open (ARP) or set IP in config.json')
@@ -538,22 +550,11 @@ function startRing() {
     const dir = ringDir(ch)
     ensureDir(dir)
     const pattern = ffPath(path.join(dir, 'r_%02d.mp4'))
-    ensureLiveHub(ch)
+    ensureDir(previewDir())
     const src = inputArgs(ch)
-    const localLive = `http://127.0.0.1:${PORT}/live/${ch}.mjpeg`
     const fromUrl = src.fromUrl
     const kind = src.kind
-    const inArgs = (src.kind === 'mjpeg' && src.args)
-      ? [
-          '-f', 'mjpeg',
-          '-reconnect', '1',
-          '-reconnect_streamed', '1',
-          '-reconnect_delay_max', '4',
-          '-fflags', '+genpts+discardcorrupt',
-          '-use_wallclock_as_timestamps', '1',
-          '-i', localLive,
-        ]
-      : src.args
+    const inArgs = src.args
     if (!inArgs) {
       console.log(`[sidecar] ring ${ch} skipped (not fitted)`)
       continue
@@ -568,10 +569,12 @@ function startRing() {
     }
     const gop = RING_SEG * geometry(ch).fps
     const br = Math.round((config.bitratesKbps?.[ch] ?? 3000) * 0.5)
+    const prev = ffPath(previewFile(ch))
     const args = [
       '-y', '-hide_banner', '-loglevel', 'warning',
       ...inArgs,
-      '-map', '0:v:0', '-an',
+      '-filter_complex', '[0:v]split=2[vring][vt];[vt]fps=8,scale=1280:-2:flags=fast_bilinear[vprev]',
+      '-map', '[vring]', '-an',
       ...videoEncodeArgs({ enc: 'libx264', codecName: 'h264', hw: false }, br, gop),
       '-f', 'segment',
       '-segment_time', String(RING_SEG),
@@ -579,8 +582,15 @@ function startRing() {
       '-reset_timestamps', '1',
       '-segment_format_options', 'movflags=frag_keyframe+empty_moov+default_base_moof',
       pattern,
+      '-map', '[vprev]', '-an',
+      '-q:v', '5',
+      '-f', 'image2',
+      '-update', '1',
+      prev,
     ]
-    console.log(`[sidecar] ring ${ch} ← ${fromUrl || kind} → ${dir}`)
+    console.log(`[sidecar] ring+preview ${ch} ← ${fromUrl || kind}`)
+    console.log(`[sidecar]   ring ${dir}`)
+    console.log(`[sidecar]   jpeg ${prev}`)
     ringProcs[ch] = spawnLogged(ffmpegBin, args, `ring:${ch}`)
   }
   const fitted = CHANNELS.filter((c) => ringProcs[c])
@@ -1229,22 +1239,18 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(404, CORS)
         return res.end('no such channel')
       }
-      if (/\.jpe?g$/i.test(rest)) {
-        const hub = ensureLiveHub(ch)
-        if (!hub || !hub.lastJpeg) {
-          res.writeHead(503, { ...CORS, 'Retry-After': '1' })
-          return res.end('no frame yet')
-        }
+      const jpeg = readPreviewJpeg(ch)
+      if (jpeg) {
         res.writeHead(200, {
           ...CORS,
           'Content-Type': 'image/jpeg',
           'Cache-Control': 'no-store, no-cache',
-          'Content-Length': hub.lastJpeg.length,
+          'Content-Length': jpeg.length,
         })
-        return res.end(hub.lastJpeg)
+        return res.end(jpeg)
       }
-      const raw = /\.mjpeg$/i.test(rest) || url.searchParams.get('raw') === '1'
-      return attachLive(ch, req, res, raw)
+      res.writeHead(503, { ...CORS, 'Retry-After': '1' })
+      return res.end('no frame yet — wait for ffmpeg preview')
     }
     if (method === 'GET' && url.pathname === '/caps') return json(res, 200, getCaps())
     if (method === 'GET' && url.pathname === '/status') {
