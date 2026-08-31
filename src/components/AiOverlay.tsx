@@ -1,5 +1,6 @@
 import { useHmiStore } from '../store/useHmiStore'
 import { cn } from '../lib/utils'
+import { AI_CAM_H, AI_CAM_W, AI_CROP, AI_OFF_X, AI_OFF_Y } from '../adapters/panoptesAi'
 
 export function AiOverlay() {
   const enabled = useHmiStore((s) => s.aiEnabled)
@@ -11,15 +12,13 @@ export function AiOverlay() {
 
   return (
     <div className="absolute inset-0 pointer-events-none z-[15]">
-      {/* 640×640 NN crop — square, always viewport-centered */}
       <div
         className="absolute border border-dashed border-[#00E5FF]/40 bg-[#00E5FF]/5"
         style={{
-          left: '50%',
-          top: '50%',
-          width: 'min(36%, 56%)',
-          aspectRatio: '1 / 1',
-          transform: 'translate(-50%, -50%)',
+          left: `${(AI_OFF_X / AI_CAM_W) * 100}%`,
+          top: `${(AI_OFF_Y / AI_CAM_H) * 100}%`,
+          width: `${(AI_CROP / AI_CAM_W) * 100}%`,
+          height: `${(AI_CROP / AI_CAM_H) * 100}%`,
         }}
       />
       {boxes.map((b) => {

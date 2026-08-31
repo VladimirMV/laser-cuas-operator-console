@@ -91,15 +91,31 @@ function pickEncoder(codec) {
   return null
 }
 
-function channelUrl(ch) {
-  const envKey = `STREAM_${ch}`
-  if (process.env[envKey]) return process.env[envKey].trim()
+function channelKind(ch) {
   const cfg = config.channels?.[ch] || {}
+  if ((cfg.kind || '').toLowerCase() === 'none') return 'none'
+  const envVal = (process.env[`STREAM_${ch}`] || '').trim()
+  const primary = envVal || (cfg.url || '').trim()
+  if (!primary || primary === 'testsrc') {
+    if ((cfg.kind || '').toLowerCase() === 'testsrc' || primary === 'testsrc' || envVal === 'testsrc') return 'testsrc'
+    return (cfg.labUrl || '').trim() ? 'file' : 'none'
+  }
+  if (primary.startsWith('rtsp://')) return 'rtsp'
+  if (/\.(mp4|mkv|mov|m3u8|ts)(\?|$)/i.test(primary)) return 'file'
+  if (/^https?:/i.test(primary)) return (cfg.kind || 'mjpeg').toLowerCase()
+  return 'testsrc'
+}
+
+function channelUrl(ch) {
+  const envVal = (process.env[`STREAM_${ch}`] || '').trim()
+  const cfg = config.channels?.[ch] || {}
+  if ((cfg.kind || '').toLowerCase() === 'none' && !envVal) return ''
+  if (envVal && envVal !== 'testsrc') return envVal
+  if (envVal === 'testsrc') return ''
   const primary = (cfg.url || '').trim()
   if (primary === 'testsrc') return ''
   if (primary) return primary
-  const lab = (cfg.labUrl || '').trim()
-  return lab
+  return (cfg.labUrl || cfg.fallback || '').trim()
 }
 
 function sessionDir(sessionId) {
@@ -122,21 +138,41 @@ function geometry(ch) {
   return { size: '640x512', w: 640, h: 512, fps: 30 }
 }
 
-function inputArgs(ch, { realtime = true } = {}) {
+function inputArgs(ch) {
   const url = channelUrl(ch)
+  const kind = channelKind(ch)
   const g = geometry(ch)
-  if (url && !url.startsWith('testsrc')) {
-    const args = []
-    if (realtime) args.push('-re')
-    if (url.startsWith('rtsp://')) args.push('-rtsp_transport', 'tcp')
-    if (/^https?:/i.test(url) || /\.(mp4|mkv|mov|ts)$/i.test(url)) args.push('-stream_loop', '-1')
-    args.push('-i', url)
-    return { args, fromUrl: url }
+  if (kind === 'none' || (!url && kind !== 'testsrc')) {
+    return { args: null, fromUrl: null, kind: 'none' }
   }
-  return {
-    args: ['-f', 'lavfi', '-i', `testsrc=size=${g.size}:rate=${g.fps}`],
-    fromUrl: null,
+  if (!url || kind === 'testsrc') {
+    return {
+      args: ['-f', 'lavfi', '-i', `testsrc=size=${g.size}:rate=${g.fps}`],
+      fromUrl: null,
+      kind: 'testsrc',
+    }
   }
+  if (kind === 'rtsp') {
+    return { args: ['-rtsp_transport', 'tcp', '-i', url], fromUrl: url, kind }
+  }
+  if (kind === 'mjpeg') {
+    return {
+      args: [
+        '-reconnect', '1',
+        '-reconnect_streamed', '1',
+        '-reconnect_delay_max', '4',
+        '-fflags', '+genpts+discardcorrupt',
+        '-use_wallclock_as_timestamps', '1',
+        '-i', url,
+      ],
+      fromUrl: url,
+      kind,
+    }
+  }
+  const args = []
+  if (/\.(mp4|mkv|mov|ts|m3u8)(\?|$)/i.test(url)) args.push('-stream_loop', '-1', '-re')
+  args.push('-i', url)
+  return { args, fromUrl: url, kind }
 }
 
 function videoEncodeArgs(encoder, bitrateKbps, gop) {
@@ -183,7 +219,11 @@ function startRing() {
     const dir = ringDir(ch)
     ensureDir(dir)
     const pattern = ffPath(path.join(dir, 'r_%02d.mp4'))
-    const { args: inArgs, fromUrl } = inputArgs(ch)
+    const { args: inArgs, fromUrl, kind } = inputArgs(ch)
+    if (!inArgs) {
+      console.log(`[sidecar] ring ${ch} skipped (not fitted)`)
+      continue
+    }
     const gop = RING_SEG * geometry(ch).fps
     const br = Math.round((config.bitratesKbps?.[ch] ?? 3000) * 0.5)
     const args = [
@@ -198,13 +238,14 @@ function startRing() {
       '-segment_format_options', 'movflags=frag_keyframe+empty_moov+default_base_moof',
       pattern,
     ]
-    console.log(`[sidecar] ring ${ch} ← ${fromUrl || 'testsrc'} → ${dir}`)
+    console.log(`[sidecar] ring ${ch} ← ${fromUrl || kind} → ${dir}`)
     ringProcs[ch] = spawnLogged(ffmpegBin, args, `ring:${ch}`)
   }
-  ringHot = CHANNELS.every((ch) => ringProcs[ch] && !ringProcs[ch].killed)
-  for (const ch of CHANNELS) {
+  const fitted = CHANNELS.filter((c) => ringProcs[c])
+  ringHot = fitted.length > 0 && fitted.every((ch) => ringProcs[ch] && !ringProcs[ch].killed)
+  for (const ch of fitted) {
     ringProcs[ch]?.on('exit', () => {
-      ringHot = CHANNELS.every((c) => ringProcs[c] && ringProcs[c].exitCode == null && !ringProcs[c].killed)
+      ringHot = fitted.every((c) => ringProcs[c] && ringProcs[c].exitCode == null && !ringProcs[c].killed)
     })
   }
 }
@@ -381,7 +422,11 @@ async function handleStart(body) {
     const outDir = channelDir(sessionId, ch)
     ensureDir(outDir)
     const outFile = ffPath(path.join(outDir, `rec_live_${encoder.codecName}.mp4`))
-    const { args: inArgs, fromUrl } = inputArgs(ch)
+    const { args: inArgs, fromUrl, kind } = inputArgs(ch)
+    if (!inArgs) {
+      console.log(`[sidecar] REC ${ch} skipped (not fitted)`)
+      continue
+    }
     const gop = Math.max(geometry(ch).fps, 2 * geometry(ch).fps)
     const args = [
       '-y', '-hide_banner', '-loglevel', 'warning',
@@ -392,7 +437,7 @@ async function handleStart(body) {
       '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
       outFile,
     ]
-    console.log(`[sidecar] REC ${ch} ← ${fromUrl || 'testsrc'} → ${outDir} (${encoder.enc} ${br}k)`)
+    console.log(`[sidecar] REC ${ch} ← ${fromUrl || kind} → ${outDir} (${encoder.enc} ${br}k)`)
     ffmpegProcs.push(spawnLogged(ffmpegBin, args, ch))
     const ref = {
       id: `MED-open-${ch}-${t0}`,
@@ -492,7 +537,8 @@ async function handleSnapshot(body) {
   const mono = recording ? Date.now() - recording.startedAt : 0
   const name = `${mono}_${body.triggerEventId || 'SNAP'}_${ch}.jpg`
   const outFile = path.join(snapDir, name)
-  const { args: inArgs } = inputArgs(ch, { realtime: false })
+  const { args: inArgs } = inputArgs(ch)
+  if (!inArgs) return { ok: false, message: `channel ${ch} not fitted` }
   const args = ['-y', '-hide_banner', '-loglevel', 'error', ...inArgs, '-frames:v', '1', '-q:v', '2', outFile]
   try {
     execFileSync(ffmpegBin, args, { timeout: 20000 })
@@ -788,9 +834,10 @@ server.listen(PORT, HOST, () => {
   console.log(`[sidecar] mediaRoot=${MEDIA_ROOT}`)
   console.log(`[sidecar] ffmpeg=${ffmpegInfo.ok} bin=${ffmpegBin} h265=${ffmpegInfo.h265} h264=${ffmpegInfo.h264}`)
   for (const ch of CHANNELS) {
-    console.log(`[sidecar] ${ch}: ${channelUrl(ch) || '(testsrc)'}`)
+    console.log(`[sidecar] ${ch}: ${channelUrl(ch) || channelKind(ch)}`)
   }
   startRing()
-  ringHot = CHANNELS.every((ch) => ringProcs[ch] && ringProcs[ch].exitCode == null)
+  const live = CHANNELS.filter((c) => ringProcs[c])
+  ringHot = live.length > 0 && live.every((ch) => ringProcs[ch] && ringProcs[ch].exitCode == null)
   console.log(`[sidecar] ringHot=${ringHot}  ${RING_SEG}s × ${RING_WRAP} = ${RING_SEG * RING_WRAP}s`)
 })

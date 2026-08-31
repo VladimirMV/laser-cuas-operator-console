@@ -25,9 +25,9 @@ services:
       SIDECAR_PORT: "8787"
       MEDIA_ROOT: /data/media
       FFMPEG_PATH: /usr/bin/ffmpeg
-      STREAM_LONG: ${STREAM_LONG:-testsrc}
-      STREAM_WIDE: ${STREAM_WIDE:-testsrc}
-      STREAM_IR: ${STREAM_IR:-testsrc}
+      STREAM_LONG: ${STREAM_LONG:-http://panoptes-base.local/2k-stream}
+      STREAM_WIDE: ${STREAM_WIDE:-}
+      STREAM_IR: ${STREAM_IR:-http://panoptes.local/thermal/stream}
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "panoptes.local:host-gateway"

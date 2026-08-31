@@ -5,6 +5,7 @@ import { resolveChannelStream } from '../lib/streams'
 import { MainMapView } from './MainMapView'
 import { StreamPlayer } from './StreamPlayer'
 import { AiOverlay } from './AiOverlay'
+import { VideoOverlayFrame } from './VideoOverlayFrame'
 import { Circle, SlidersHorizontal } from 'lucide-react'
 import { motion, AnimatePresence } from 'framer-motion'
 import type { CameraChannel } from '../types/hmi'
@@ -23,6 +24,7 @@ export function MainVideo() {
   const aiEnabled = useHmiStore((s) => s.aiEnabled)
   const aiLink = useHmiStore((s) => s.aiLink)
   const toggleAi = useHmiStore((s) => s.toggleAi)
+  const aiTargets = useHmiStore((s) => s.aiTargets)
   const { t } = useT()
 
   const isMap = activeCamera === 'MAP'
@@ -94,7 +96,30 @@ export function MainVideo() {
         ))}
       </div>
 
-      {camChannel === 'LONG' && <AiOverlay />}
+      <VideoOverlayFrame zoom={cameraAdjust[camChannel].zoom}>
+        {camChannel === 'LONG' && <AiOverlay />}
+        {target && target.trackState !== 'SEARCH' && target.trackState !== 'LOST' && aiTargets.length === 0 && (() => {
+          const box = Math.max(4, Math.min(14, 12000 / Math.max(range, 1)))
+          const cx = target.posX ?? 50
+          const cy = target.posY ?? 50
+          return (
+            <div
+              className="absolute pointer-events-none"
+              style={{
+                left: `${cx}%`,
+                top: `${cy}%`,
+                width: `${box}%`,
+                aspectRatio: '1 / 1',
+                transform: 'translate(-50%, -50%)',
+                borderWidth: 2,
+                borderStyle: target.trackState === 'COAST' ? 'dashed' : 'solid',
+                borderColor: trackColor,
+                opacity: isLost ? 0.55 : 1,
+              }}
+            />
+          )
+        })()}
+      </VideoOverlayFrame>
 
       <div className="absolute top-3 left-3 z-20 flex items-center gap-2 flex-wrap">
         <div className="px-2.5 py-1 rounded bg-black/60 border border-[#30363D] font-mono text-xs tracking-widest text-[#8B949E]">
@@ -190,27 +215,6 @@ export function MainVideo() {
         )}
       </AnimatePresence>
 
-      {target && target.trackState !== 'SEARCH' && target.trackState !== 'LOST' && (() => {
-        const box = Math.max(8, Math.min(22, 18000 / Math.max(range, 1)))
-        const cx = target.posX ?? 50
-        const cy = target.posY ?? 50
-        return (
-          <div
-            className="absolute pointer-events-none z-10"
-            style={{
-              left: `${cx}%`,
-              top: `${cy}%`,
-              width: `${box}%`,
-              aspectRatio: '1 / 1',
-              transform: 'translate(-50%, -50%)',
-              borderWidth: 2,
-              borderStyle: target.trackState === 'COAST' ? 'dashed' : 'solid',
-              borderColor: trackColor,
-              opacity: isLost ? 0.55 : 1,
-            }}
-          />
-        )
-      })()}
 
       <AnimatePresence>
         {isLost && (

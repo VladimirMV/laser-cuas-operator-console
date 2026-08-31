@@ -33,8 +33,10 @@ function toBox(id: string, t: Record<string, unknown>): AiBox | null {
   const w = Number(t.w ?? t.width)
   const h = Number(t.h ?? t.height)
   if (![cx, cy, w, h].every(Number.isFinite)) return null
-  const absCx = cx + AI_OFF_X
-  const absCy = cy + AI_OFF_Y
+  // Jetson sends 640×640 crop pixels. If a payload is already full-frame, don't offset twice.
+  const cropSpace = cx <= AI_CROP + 16 && cy <= AI_CROP + 16
+  const absCx = cropSpace ? cx + AI_OFF_X : cx
+  const absCy = cropSpace ? cy + AI_OFF_Y : cy
   return {
     id,
     cx,

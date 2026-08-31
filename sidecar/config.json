@@ -15,17 +15,19 @@
   },
   "channels": {
     "LONG": {
-      "url": "testsrc",
-      "labUrl": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4",
-      "comment": "Set RTSP here for live turret. testsrc = lab pattern (real mp4). Or copy labUrl into url."
+      "url": "http://panoptes-base.local/2k-stream",
+      "fallback": "http://panoptes.local/2k-stream",
+      "kind": "mjpeg",
+      "comment": "Same MJPEG the HMI shows. Override with env STREAM_LONG."
     },
     "WIDE": {
-      "url": "testsrc",
-      "labUrl": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4"
+      "url": "",
+      "kind": "none",
+      "comment": "Not fitted on this turret — do not record a lab pattern."
     },
     "IR": {
-      "url": "testsrc",
-      "labUrl": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerJoyrides.mp4"
+      "url": "http://panoptes.local/thermal/stream",
+      "kind": "mjpeg"
     }
   },
   "ffmpegPath": "ffmpeg",
