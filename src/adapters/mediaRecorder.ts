@@ -332,7 +332,7 @@ let resolvedRecorder: IMediaRecorder = mediaRecorderMock
 
 export async function resolveMediaRecorder(baseUrl: string = DEFAULT_SIDECAR_URL): Promise<IMediaRecorder> {
   const caps = await HttpMediaRecorder.probe(baseUrl)
-  if (caps && caps.ffmpeg !== false) {
+  if (caps) {
     resolvedRecorder = new HttpMediaRecorder(baseUrl)
     return resolvedRecorder
   }

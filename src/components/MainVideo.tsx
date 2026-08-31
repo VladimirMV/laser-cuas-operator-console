@@ -5,12 +5,42 @@ import { resolveChannelStream } from '../lib/streams'
 import { MainMapView } from './MainMapView'
 import { StreamPlayer } from './StreamPlayer'
 import { AiOverlay } from './AiOverlay'
-import { VideoOverlayFrame } from './VideoOverlayFrame'
+import { SensorBox, VideoOverlayFrame } from './VideoOverlayFrame'
 import { Circle, SlidersHorizontal } from 'lucide-react'
 import { motion, AnimatePresence } from 'framer-motion'
 import type { CameraChannel } from '../types/hmi'
 
 const ALL_CAMS: CameraChannel[] = ['LONG', 'WIDE', 'IR']
+
+function TrackGate({
+  cxPct, cyPct, range, color, dashed, dim,
+}: {
+  cxPct: number
+  cyPct: number
+  range: number
+  color: string
+  dashed: boolean
+  dim: boolean
+}) {
+  const size = Math.max(72, Math.min(220, 280000 / Math.max(range, 1)))
+  const sx = (cxPct / 100) * 1920 - size / 2
+  const sy = (cyPct / 100) * 1080 - size / 2
+  return (
+    <SensorBox
+      sx={sx}
+      sy={sy}
+      sw={size}
+      sh={size}
+      style={{
+        borderWidth: 2,
+        borderStyle: dashed ? 'dashed' : 'solid',
+        borderColor: color,
+        opacity: dim ? 0.55 : 1,
+      }}
+    />
+  )
+}
+
 
 export function MainVideo() {
   const target = useHmiStore((s) => s.target)
@@ -24,7 +54,6 @@ export function MainVideo() {
   const aiEnabled = useHmiStore((s) => s.aiEnabled)
   const aiLink = useHmiStore((s) => s.aiLink)
   const toggleAi = useHmiStore((s) => s.toggleAi)
-  const aiTargets = useHmiStore((s) => s.aiTargets)
   const { t } = useT()
 
   const isMap = activeCamera === 'MAP'
@@ -98,27 +127,16 @@ export function MainVideo() {
 
       <VideoOverlayFrame zoom={cameraAdjust[camChannel].zoom}>
         {camChannel === 'LONG' && <AiOverlay />}
-        {target && target.trackState !== 'SEARCH' && target.trackState !== 'LOST' && aiTargets.length === 0 && (() => {
-          const box = Math.max(4, Math.min(14, 12000 / Math.max(range, 1)))
-          const cx = target.posX ?? 50
-          const cy = target.posY ?? 50
-          return (
-            <div
-              className="absolute pointer-events-none"
-              style={{
-                left: `${cx}%`,
-                top: `${cy}%`,
-                width: `${box}%`,
-                aspectRatio: '1 / 1',
-                transform: 'translate(-50%, -50%)',
-                borderWidth: 2,
-                borderStyle: target.trackState === 'COAST' ? 'dashed' : 'solid',
-                borderColor: trackColor,
-                opacity: isLost ? 0.55 : 1,
-              }}
-            />
-          )
-        })()}
+        {!aiEnabled && target && target.trackState !== 'SEARCH' && target.trackState !== 'LOST' && (
+          <TrackGate
+            cxPct={target.posX ?? 50}
+            cyPct={target.posY ?? 50}
+            range={range}
+            color={trackColor}
+            dashed={target.trackState === 'COAST'}
+            dim={isLost}
+          />
+        )}
       </VideoOverlayFrame>
 
       <div className="absolute top-3 left-3 z-20 flex items-center gap-2 flex-wrap">

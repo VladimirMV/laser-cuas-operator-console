@@ -1,58 +1,122 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { createContext, useContext, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react'
+import { mapSensorRect, type CoverMap } from '../lib/sensorScreen'
 
-/**
- * Positions children in the same rectangle as an object-cover 1920×1080 stream,
- * including digital zoom from the optical centre. Sensor % then match pixels.
- */
+const OverlayCtx = createContext<CoverMap | null>(null)
+
+export function useOverlayMap(): CoverMap | null {
+  return useContext(OverlayCtx)
+}
+
 export function VideoOverlayFrame({
   srcW = 1920,
   srcH = 1080,
   zoom = 1,
-  className,
   children,
 }: {
   srcW?: number
   srcH?: number
   zoom?: number
-  className?: string
   children: ReactNode
 }) {
   const host = useRef<HTMLDivElement>(null)
-  const [box, setBox] = useState({ left: 0, top: 0, width: 0, height: 0 })
+  const [map, setMap] = useState<CoverMap>({ cw: 0, ch: 0, srcW, srcH, zoom })
 
   useEffect(() => {
     const el = host.current
     if (!el) return
     const measure = () => {
-      const W = el.clientWidth
-      const H = el.clientHeight
-      if (!W || !H) return
-      const scale = Math.max(W / srcW, H / srcH)
-      const width = srcW * scale
-      const height = srcH * scale
-      setBox({ left: (W - width) / 2, top: (H - height) / 2, width, height })
+      setMap({
+        cw: el.clientWidth,
+        ch: el.clientHeight,
+        srcW,
+        srcH,
+        zoom: Math.max(1, zoom),
+      })
     }
     measure()
     const ro = new ResizeObserver(measure)
     ro.observe(el)
     return () => ro.disconnect()
-  }, [srcW, srcH])
+  }, [srcW, srcH, zoom])
 
   return (
-    <div ref={host} className={className ?? 'absolute inset-0 overflow-hidden pointer-events-none z-10'}>
-      <div
-        className="absolute"
-        style={{
-          left: box.left,
-          top: box.top,
-          width: box.width,
-          height: box.height,
-          transform: `scale(${Math.max(1, zoom)})`,
-          transformOrigin: 'center center',
-        }}
-      >
+    <OverlayCtx.Provider value={map}>
+      <div ref={host} className="absolute inset-0 overflow-hidden pointer-events-none z-10">
         {children}
       </div>
+    </OverlayCtx.Provider>
+  )
+}
+
+export function SensorBox({
+  sx,
+  sy,
+  sw,
+  sh,
+  className,
+  style,
+  children,
+}: {
+  sx: number
+  sy: number
+  sw: number
+  sh: number
+  className?: string
+  style?: CSSProperties
+  children?: ReactNode
+}) {
+  const m = useOverlayMap()
+  if (!m || !m.cw) return null
+  const r = mapSensorRect(m, sx, sy, sw, sh)
+  return (
+    <div
+      className={className}
+      style={{
+        position: 'absolute',
+        left: r.left,
+        top: r.top,
+        width: r.width,
+        height: r.height,
+        boxSizing: 'border-box',
+        ...style,
+      }}
+    >
+      {children}
+    </div>
+  )
+}
+
+export function SensorLabel({
+  sx,
+  sy,
+  text,
+  className,
+}: {
+  sx: number
+  sy: number
+  text: string
+  className?: string
+}) {
+  const m = useOverlayMap()
+  if (!m || !m.cw) return null
+  const r = mapSensorRect(m, sx, sy, 1, 1)
+  return (
+    <div
+      className={className}
+      style={{
+        position: 'absolute',
+        left: r.left,
+        top: r.top,
+        transform: 'translateY(-100%)',
+        fontSize: 10,
+        lineHeight: '16px',
+        padding: '1px 5px',
+        whiteSpace: 'nowrap',
+        pointerEvents: 'none',
+        zIndex: 2,
+      }}
+    >
+      {text}
     </div>
   )
 }

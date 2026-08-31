@@ -12,6 +12,7 @@ import { spawn, execFileSync, execFile } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 import { promisify } from 'node:util'
+import { resolveUrlHost } from './mdns.mjs'
 
 const execFileAsync = promisify(execFile)
 const require = createRequire(import.meta.url)
@@ -138,8 +139,31 @@ function geometry(ch) {
   return { size: '640x512', w: 640, h: 512, fps: 30 }
 }
 
+const resolvedUrls = Object.create(null)
+
+async function resolveChannelUrls() {
+  for (const ch of CHANNELS) {
+    const url = channelUrl(ch)
+    if (!url) {
+      resolvedUrls[ch] = ''
+      continue
+    }
+    const next = await resolveUrlHost(url)
+    resolvedUrls[ch] = next
+    if (next !== url) console.log(`[sidecar] resolved ${ch}: ${url} → ${next}`)
+    else if (/\.local[:/\s]/i.test(url) || /\.local$/i.test(url.split('/')[2] || '')) {
+      console.warn(`[sidecar] ${ch}: could not resolve ${url} (Windows mDNS). ffmpeg will likely fail.`)
+    }
+  }
+}
+
+function liveUrl(ch) {
+  if (resolvedUrls[ch]) return resolvedUrls[ch]
+  return channelUrl(ch)
+}
+
 function inputArgs(ch) {
-  const url = channelUrl(ch)
+  const url = liveUrl(ch)
   const kind = channelKind(ch)
   const g = geometry(ch)
   if (kind === 'none' || (!url && kind !== 'testsrc')) {
@@ -388,6 +412,7 @@ function diskBytes() {
 async function handleStart(body) {
   if (recording) return { ok: false, message: 'Already recording', sessionId: recording.sessionId }
   if (!ffmpegInfo.ok) return { ok: false, message: 'FFmpeg not available on side-car host' }
+  await resolveChannelUrls()
 
   const sessionId = String(body.sessionId || `SES-${Date.now()}`)
   let channels = Array.isArray(body.channels) ? body.channels.map(String) : ['LONG', 'IR']
@@ -397,6 +422,16 @@ async function handleStart(body) {
   const wantCodec = body.codec === 'h264' ? 'h264' : 'h265'
   const encoder = pickEncoder(wantCodec)
   if (!encoder) return { ok: false, message: 'No suitable video encoder' }
+
+  for (const ch of channels) {
+    const u = liveUrl(ch)
+    if (u && /\.local([:/]|$)/i.test(u)) {
+      return {
+        ok: false,
+        message: 'Cannot resolve ' + u + ' (Windows mDNS). Put camera IP in sidecar/config.json, e.g. http://192.168.1.20/2k-stream',
+      }
+    }
+  }
 
   const segmentDurationSec = Number(body.segmentDurationSec || config.segmentDurationSec || 15)
   const prerollSec = Number(body.prerollSec || DEFAULT_PREROLL)
@@ -836,8 +871,10 @@ server.listen(PORT, HOST, () => {
   for (const ch of CHANNELS) {
     console.log(`[sidecar] ${ch}: ${channelUrl(ch) || channelKind(ch)}`)
   }
-  startRing()
-  const live = CHANNELS.filter((c) => ringProcs[c])
-  ringHot = live.length > 0 && live.every((ch) => ringProcs[ch] && ringProcs[ch].exitCode == null)
-  console.log(`[sidecar] ringHot=${ringHot}  ${RING_SEG}s × ${RING_WRAP} = ${RING_SEG * RING_WRAP}s`)
+  resolveChannelUrls().then(() => {
+    startRing()
+    const live = CHANNELS.filter((c) => ringProcs[c])
+    ringHot = live.length > 0 && live.every((ch) => ringProcs[ch] && ringProcs[ch].exitCode == null)
+    console.log(`[sidecar] ringHot=${ringHot}  ${RING_SEG}s × ${RING_WRAP} = ${RING_SEG * RING_WRAP}s`)
+  }).catch((e) => console.error('[sidecar] resolve/ring', e))
 })
