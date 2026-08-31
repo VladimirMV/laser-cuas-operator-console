@@ -472,6 +472,44 @@ export class MockArchiveAdapter implements IArchiveWriter, IArchiveReader {
     })
   }
 
+  ensureNamedSession(id: string, note: string, channels: Array<'LONG' | 'WIDE' | 'IR'> = ['LONG', 'IR']): string {
+    if (this.sessions.has(id)) return id
+    const t0 = Date.now()
+    this.sessions.set(id, {
+      meta: {
+        id,
+        mission_id: 'MIS-LIVE',
+        started_at: new Date(t0).toISOString(),
+        duration_sec: 0,
+        operator_note: note,
+        sealed: false,
+        recording: true,
+        channels,
+        software_version: SW_VERSION,
+        event_count: 0,
+        engagement_count: 0,
+        had_fire: false,
+        modes: [],
+      },
+      t0,
+      events: [],
+      telemetry: [],
+      media: [],
+      config: [],
+      engagements: new Map(),
+      openEngagementId: null,
+    })
+    return id
+  }
+
+  replaceSessionMedia(id: string, refs: MediaRef[]): void {
+    const s = this.sessions.get(id)
+    if (!s) return
+    s.media = refs.map((r) => ({ ...r, session_id: id, id: r.id || uid('MED') }))
+    s.meta.recording = true
+    s.meta.duration_sec = Math.max(0, Math.round((Date.now() - s.t0) / 1000))
+  }
+
   sealSession(session_id?: string): void {
     const id = session_id ?? this.activeId
     if (!id) return

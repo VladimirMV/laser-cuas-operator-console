@@ -40,7 +40,7 @@ import {
   mapLegacySource,
   SW_VERSION,
 } from '../adapters/archive'
-import { getMediaRecorder, HttpMediaRecorder } from '../adapters/mediaRecorder'
+import { getMediaRecorder, HttpMediaRecorder, absMediaUrl } from '../adapters/mediaRecorder'
 import { getPanoptesController } from '../adapters/panoptes'
 import type { AiBox } from '../adapters/panoptesAi'
 import { setBaseTracking } from '../adapters/panoptesBase'
@@ -52,6 +52,8 @@ import {
   channelsFromPreset,
   activeChannelList,
 } from '../types/archive'
+
+let autoRecStarted = false
 
 interface HmiStore {
   systemStatus: SystemStatus
@@ -1236,10 +1238,35 @@ export const useHmiStore = create<HmiStore>((set, get) => ({
     if (!st.ringHot || mdns) {
       await HttpMediaRecorder.discover(undefined, false)
     }
+    const files = await HttpMediaRecorder.fetchRingIndex()
+    if (files.length) {
+      archiveMock.ensureNamedSession('RING', 'Always-on 90s camera ring · H.264', ['LONG', 'IR'])
+      archiveMock.replaceSessionMedia(
+        'RING',
+        files.map((f) => ({
+          id: f.id || `RING-${f.channel}`,
+          ts_utc: new Date().toISOString(),
+          t_mono_ms: f.t_mono_ms || 0,
+          session_id: 'RING',
+          channel: (f.channel as 'LONG' | 'IR' | 'WIDE') || 'LONG',
+          kind: 'SEGMENT',
+          label: f.file || f.path || f.channel,
+          codec: 'h264',
+          container: 'mp4',
+          url: absMediaUrl(f.url),
+          path: f.path,
+        }))
+      )
+    }
+    if (st.ringHot && !get().recording && !autoRecStarted) {
+      autoRecStarted = true
+      get().toggleRecording()
+    }
     set({
       sidecarConnected: true,
       ringHot: !!st.ringHot,
       mediaRoot: st.mediaRoot || get().mediaRoot,
+      recordingActualCodec: get().recording ? get().recordingActualCodec : files.length ? 'h264' : get().recordingActualCodec,
     })
   },
 

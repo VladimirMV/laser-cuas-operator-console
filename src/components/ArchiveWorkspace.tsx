@@ -50,6 +50,14 @@ function ReplayFeed({
       try { el.currentTime = Math.max(0, off) } catch { /* */ }
     }
   }, [playhead, url, seg])
+  useEffect(() => {
+    const el = vid.current
+    if (!el || !url) return
+    const play = () => { void el.play().catch(() => undefined) }
+    el.addEventListener('loadeddata', play)
+    play()
+    return () => el.removeEventListener('loadeddata', play)
+  }, [url])
   return (
     <div className={className}>
       {url && (
@@ -58,7 +66,8 @@ function ReplayFeed({
           src={url}
           muted
           playsInline
-          className="absolute inset-0 h-full w-full object-cover"
+          autoPlay
+          className="absolute inset-0 h-full w-full object-cover bg-black"
         />
       )}
       <ReplayCanvas channel={channel} hud={hud!} t={playhead} hasVideo={!!url} className="absolute inset-0 h-full w-full" />
@@ -73,7 +82,7 @@ export function ArchiveWorkspace() {
     listArchiveSessions, getArchiveBundle, exportArchiveSessionJson, exportArchiveSessionCsv,
     deleteArchiveSession, ensureArchiveSession, recordingProfile, setRecordingPreset,
     setRecChannel, setRecordingCodec, recordingActualCodec,
-    sidecarConnected, mediaRoot, exportEngagementClip,
+    sidecarConnected, mediaRoot, exportEngagementClip, ringHot,
   } = useHmiStore()
   const { t } = useT()
 
@@ -88,6 +97,12 @@ export function ArchiveWorkspace() {
   const [filterFire, setFilterFire] = useState(false)
 
   const refresh = () => setSessions(listArchiveSessions())
+  useEffect(() => {
+    refresh()
+    const list = listArchiveSessions()
+    const ring = list.find((s) => s.id === 'RING')
+    if (ring && sidecarConnected) setSelectedId('RING')
+  }, [sidecarConnected, ringHot])
   const bundle: SessionBundle | null = useMemo(
     () => (selectedId ? getArchiveBundle(selectedId) : null),
     [selectedId, sessions, getArchiveBundle]

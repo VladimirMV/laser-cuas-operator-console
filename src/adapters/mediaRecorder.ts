@@ -262,6 +262,17 @@ export class HttpMediaRecorder implements IMediaRecorder {
     }
   }
 
+  static async fetchRingIndex(baseUrl: string = DEFAULT_SIDECAR_URL): Promise<{ url?: string; channel?: string; t_mono_ms?: number; id?: string; kind?: string; codec?: string; container?: string; label?: string; path?: string }[]> {
+    try {
+      const res = await fetch(`${baseUrl.replace(/\/$/, '')}/ring/index`, { signal: AbortSignal.timeout(3000) })
+      if (!res.ok) return []
+      const data = (await res.json()) as { files?: { url: string; channel: string; t_mono_ms: number; id: string; kind: string; codec: string; container: string; file: string; path: string }[] }
+      return data.files || []
+    } catch {
+      return []
+    }
+  }
+
   static async fetchStatus(baseUrl: string = DEFAULT_SIDECAR_URL): Promise<SidecarStatus | null> {
     try {
       const res = await fetch(`${baseUrl.replace(/\/$/, '')}/status`, { signal: AbortSignal.timeout(2000) })

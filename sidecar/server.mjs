@@ -275,6 +275,7 @@ async function refreshAndRing({ scan = false } = {}) {
   if (already && ringHot) return true
   stopRing()
   startRing()
+  if (ringHot) startLiveHarvest()
   return ringHot
 }
 
@@ -321,6 +322,7 @@ function startRing() {
   }
   const fitted = CHANNELS.filter((c) => ringProcs[c])
   ringHot = fitted.length > 0 && fitted.every((ch) => ringProcs[ch] && !ringProcs[ch].killed)
+  if (ringHot) startLiveHarvest()
   for (const ch of fitted) {
     ringProcs[ch]?.on('exit', () => {
       ringHot = fitted.every((c) => ringProcs[c] && ringProcs[c].exitCode == null && !ringProcs[c].killed)
@@ -341,6 +343,99 @@ function listRingFiles(ch) {
     })
     .filter((x) => x.size > 1024)
     .sort((a, b) => a.mtime - b.mtime)
+}
+
+function remuxCopy(from, to) {
+  try {
+    execFileSync(
+      ffmpegBin,
+      ['-y', '-hide_banner', '-loglevel', 'error', '-i', from, '-c', 'copy', '-movflags', '+faststart', to],
+      { timeout: 25000 }
+    )
+    return fs.existsSync(to) && fs.statSync(to).size > 512
+  } catch {
+    try {
+      fs.copyFileSync(from, to)
+      return true
+    } catch {
+      return false
+    }
+  }
+}
+
+const harvested = new Set()
+
+function harvestRing(sessionId, channels) {
+  const refs = []
+  for (const ch of channels) {
+    const files = listRingFiles(ch)
+    const closed = files.length > 1 ? files.slice(0, -1) : files
+    const dest = channelDir(sessionId, ch)
+    ensureDir(dest)
+    closed.forEach((item, i) => {
+      const key = `${sessionId}:${ch}:${item.file}:${item.size}`
+      if (harvested.has(key)) return
+      const name = `seg_${String(i).padStart(4, '0')}_${item.file}`
+      const to = path.join(dest, name)
+      if (!remuxCopy(item.path, to)) return
+      harvested.add(key)
+      const rel = path.relative(MEDIA_ROOT, to).replace(/\\/g, '/')
+      const ref = {
+        id: `MED-${sessionId}-${ch}-${i}`,
+        ts_utc: new Date(item.mtime).toISOString(),
+        t_mono_ms: i * RING_SEG * 1000,
+        session_id: sessionId,
+        channel: ch,
+        kind: 'SEGMENT',
+        label: `${ch} ${name}`,
+        codec: 'h264',
+        container: 'mp4',
+        duration_ms: RING_SEG * 1000,
+        path: rel,
+        url: `/media/${rel}`,
+      }
+      refs.push(ref)
+      appendIndex(sessionId, ref)
+    })
+  }
+  return refs
+}
+
+function ringIndex() {
+  const out = []
+  for (const ch of CHANNELS) {
+    listRingFiles(ch).forEach((item, i) => {
+      const rel = path.relative(MEDIA_ROOT, item.path).replace(/\\/g, '/')
+      out.push({
+        id: `RING-${ch}-${item.file}`,
+        channel: ch,
+        file: item.file,
+        size: item.size,
+        mtime: item.mtime,
+        t_mono_ms: i * RING_SEG * 1000,
+        kind: 'SEGMENT',
+        codec: 'h264',
+        container: 'mp4',
+        url: `/media/${rel}`,
+        path: rel,
+      })
+    })
+  }
+  return out
+}
+
+let liveHarvestTimer = null
+function startLiveHarvest() {
+  if (liveHarvestTimer) return
+  ensureDir(sessionDir('LIVE'))
+  const tick = () => {
+    try { harvestRing('LIVE', ['LONG', 'IR']) } catch (e) {
+      console.warn('[sidecar] LIVE harvest', e.message || e)
+    }
+  }
+  tick()
+  liveHarvestTimer = setInterval(tick, RING_SEG * 1000)
+  console.log('[sidecar] LIVE harvest → media/LIVE (H.264 from ring)')
 }
 
 function copyPreroll(sessionId, channels, prerollSec) {
@@ -507,6 +602,26 @@ async function handleStart(body) {
   const refs = [...prerollRefs]
   const t0 = Date.now()
 
+  if (ringHot) {
+    refs.push(...harvestRing(sessionId, channels))
+    if (globalThis.__recHarvest) clearInterval(globalThis.__recHarvest)
+    globalThis.__recHarvest = setInterval(() => {
+      try {
+        const more = harvestRing(sessionId, channels)
+        if (recording && more.length) recording.refs.push(...more)
+      } catch { /* */ }
+    }, RING_SEG * 1000)
+    recording = {
+      sessionId, channels, codec: wantCodec, actualCodec: 'h264', encoder: 'ring-copy',
+      startedAt: t0, segmentDurationSec, prerollSec, bitrates, refs, copyMode: true,
+    }
+    console.log(`[sidecar] REC ${sessionId} from ring → ${sessionDir(sessionId)}`)
+    return {
+      ok: true, sessionId, channels, codec_target: wantCodec, codec_actual: 'h264',
+      encoder: 'ring-copy', mediaRoot: MEDIA_ROOT, prerollCopied: prerollRefs.length, refs,
+    }
+  }
+
   for (const ch of channels) {
     const br = bitrates[ch] || 3000
     const outDir = channelDir(sessionId, ch)
@@ -575,6 +690,7 @@ async function handleStart(body) {
 
 async function handleStop() {
   if (!recording) return { ok: false, message: 'Not recording', refs: [] }
+  if (globalThis.__recHarvest) { clearInterval(globalThis.__recHarvest); globalThis.__recHarvest = null }
   const snap = recording
   for (const p of ffmpegProcs) {
     try {
@@ -851,6 +967,9 @@ const server = http.createServer(async (req, res) => {
     }
     if (method === 'GET' && url.pathname === '/sessions') {
       return json(res, 200, { ok: true, mediaRoot: MEDIA_ROOT, sessions: listSessions() })
+    }
+    if (method === 'GET' && url.pathname === '/ring/index') {
+      return json(res, 200, { ok: true, ringHot, files: ringIndex() })
     }
     if (method === 'POST' && url.pathname === '/discover') {
       const body = await readBody(req).catch(() => ({}))
