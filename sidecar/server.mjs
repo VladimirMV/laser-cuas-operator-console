@@ -234,6 +234,116 @@ function liveUrl(ch) {
   return channelUrl(ch)
 }
 
+
+/** One TCP to each camera; fan-out MJPEG to HMI + ffmpeg ring. */
+const liveHubs = {}
+
+function stopLiveHub(ch) {
+  const h = liveHubs[ch]
+  if (!h) return
+  try { h.upstream?.destroy() } catch { /* */ }
+  try { h.req?.destroy() } catch { /* */ }
+  for (const c of h.clients) {
+    try { c.end() } catch { /* */ }
+  }
+  delete liveHubs[ch]
+}
+
+function ensureLiveHub(ch) {
+  const cam = liveUrl(ch)
+  if (!cam || stillMdns(cam) || cam.includes('127.0.0.1:' + PORT)) return liveHubs[ch] || null
+  const existing = liveHubs[ch]
+  if (existing && existing.cam === cam && !existing.dead) return existing
+  if (existing) stopLiveHub(ch)
+
+  const hub = {
+    cam,
+    clients: new Set(),
+    pending: [],
+    ready: false,
+    dead: false,
+    contentType: 'multipart/x-mixed-replace;boundary=frame',
+    upstream: null,
+    req: null,
+  }
+  liveHubs[ch] = hub
+
+  const connect = () => {
+    if (liveHubs[ch] !== hub) return
+    try {
+      const req = http.get(cam, { headers: { Accept: '*/*', Connection: 'keep-alive' } }, (inc) => {
+        req.setTimeout(0)
+        inc.setTimeout(0)
+        hub.upstream = inc
+        hub.contentType = inc.headers['content-type'] || hub.contentType
+        hub.ready = true
+        console.log(`[sidecar] live hub ${ch} ← ${cam}  (${hub.contentType})`)
+        for (const fn of hub.pending.splice(0)) {
+          try { fn() } catch { /* */ }
+        }
+        inc.on('data', (chunk) => {
+          for (const c of [...hub.clients]) {
+            if (!c.writable || c.destroyed) {
+              hub.clients.delete(c)
+              continue
+            }
+            try {
+              if (c.writableNeedDrain) continue
+              c.write(chunk)
+            } catch {
+              hub.clients.delete(c)
+            }
+          }
+        })
+        inc.on('end', () => {
+          hub.ready = false
+          hub.upstream = null
+          setTimeout(connect, 800)
+        })
+        inc.on('error', () => {
+          hub.ready = false
+          hub.upstream = null
+          setTimeout(connect, 1200)
+        })
+      })
+      hub.req = req
+      req.on('error', (e) => {
+        console.warn(`[sidecar] live hub ${ch} ${e.message}`)
+        hub.ready = false
+        setTimeout(connect, 1500)
+      })
+    } catch (e) {
+      console.warn(`[sidecar] live hub ${ch} ${e.message}`)
+      setTimeout(connect, 1500)
+    }
+  }
+  connect()
+  return hub
+}
+
+function attachLive(ch, req, res) {
+  const hub = ensureLiveHub(ch)
+  if (!hub) {
+    res.writeHead(503, CORS)
+    return res.end('camera not resolved')
+  }
+  const send = () => {
+    if (res.writableEnded || res.destroyed) return
+    res.writeHead(200, {
+      ...CORS,
+      'Content-Type': hub.contentType,
+      'Cache-Control': 'no-store, no-cache',
+      Pragma: 'no-cache',
+      Connection: 'keep-alive',
+    })
+    hub.clients.add(res)
+  }
+  req.on('close', () => hub.clients.delete(res))
+  if (hub.ready) send()
+  else hub.pending.push(send)
+}
+
+
 function inputArgs(ch) {
   const url = liveUrl(ch)
   const kind = channelKind(ch)
@@ -314,6 +424,9 @@ function stopRing() {
 
 async function refreshAndRing({ scan = false } = {}) {
   await resolveChannelUrls({ scan })
+  for (const ch of CHANNELS) {
+    if (ch !== 'WIDE' && liveUrl(ch) && !stillMdns(liveUrl(ch))) ensureLiveHub(ch)
+  }
   const ready = CHANNELS.filter((ch) => ch !== 'WIDE' && liveUrl(ch) && !stillMdns(liveUrl(ch)))
   if (!ready.length) {
     console.warn('[sidecar] camera IP not found yet — ring idle. Keep HMI open (ARP) or set IP in config.json')
@@ -352,7 +465,21 @@ function startRing() {
     const dir = ringDir(ch)
     ensureDir(dir)
     const pattern = ffPath(path.join(dir, 'r_%02d.mp4'))
-    const { args: inArgs, fromUrl, kind } = inputArgs(ch)
+    ensureLiveHub(ch)
+    const src = inputArgs(ch)
+    const localLive = `http://127.0.0.1:${PORT}/live/${ch}`
+    const fromUrl = src.fromUrl
+    const kind = src.kind
+    const inArgs = (src.kind === 'mjpeg' && src.args)
+      ? [
+          '-reconnect', '1',
+          '-reconnect_streamed', '1',
+          '-reconnect_delay_max', '4',
+          '-fflags', '+genpts+discardcorrupt',
+          '-use_wallclock_as_timestamps', '1',
+          '-i', localLive,
+        ]
+      : src.args
     if (!inArgs) {
       console.log(`[sidecar] ring ${ch} skipped (not fitted)`)
       continue
@@ -687,7 +814,21 @@ async function handleStart(body) {
     const outDir = channelDir(sessionId, ch)
     ensureDir(outDir)
     const outFile = ffPath(path.join(outDir, `rec_live_${encoder.codecName}.mp4`))
-    const { args: inArgs, fromUrl, kind } = inputArgs(ch)
+    ensureLiveHub(ch)
+    const src = inputArgs(ch)
+    const localLive = `http://127.0.0.1:${PORT}/live/${ch}`
+    const fromUrl = src.fromUrl
+    const kind = src.kind
+    const inArgs = (src.kind === 'mjpeg' && src.args)
+      ? [
+          '-reconnect', '1',
+          '-reconnect_streamed', '1',
+          '-reconnect_delay_max', '4',
+          '-fflags', '+genpts+discardcorrupt',
+          '-use_wallclock_as_timestamps', '1',
+          '-i', localLive,
+        ]
+      : src.args
     if (!inArgs) {
       console.log(`[sidecar] REC ${ch} skipped (not fitted)`)
       continue
@@ -1005,6 +1146,14 @@ const server = http.createServer(async (req, res) => {
   try {
     if (method === 'GET' && url.pathname === '/health') {
       return json(res, 200, { ok: true, service: 'laser-cuas-media-sidecar', version: '1.8.1', ffmpeg: ffmpegInfo.ok, ringHot })
+    }
+    if (method === 'GET' && url.pathname.startsWith('/live/')) {
+      const ch = url.pathname.slice('/live/'.length).split('.')[0].toUpperCase()
+      if (!CHANNELS.includes(ch) || ch === 'WIDE') {
+        res.writeHead(404, CORS)
+        return res.end('no such channel')
+      }
+      return attachLive(ch, req, res)
     }
     if (method === 'GET' && url.pathname === '/caps') return json(res, 200, getCaps())
     if (method === 'GET' && url.pathname === '/status') {

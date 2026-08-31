@@ -58,8 +58,8 @@ export function resolveChannelStream(channel: CameraChannel): {
       return { url: null, fallback: null, kind: 'none', label: 'NOT FITTED' }
     }
     return {
-      url,
-      fallback,
+      url: `http://127.0.0.1:8787/live/${channel}`,
+      fallback: url,
       kind: 'mjpeg',
       label: channel === 'LONG' ? 'MJPEG · DAY 2K' : 'MJPEG · THERMAL',
     }
