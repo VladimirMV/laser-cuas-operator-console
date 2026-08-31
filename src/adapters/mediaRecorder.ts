@@ -273,6 +273,20 @@ export class HttpMediaRecorder implements IMediaRecorder {
     }
   }
 
+  static async fetchSessionIndex(sessionId: string, baseUrl: string = DEFAULT_SIDECAR_URL): Promise<MediaRef[]> {
+    try {
+      const res = await fetch(
+        `${baseUrl.replace(/\/$/, '')}/sessions/${encodeURIComponent(sessionId)}/index`,
+        { signal: AbortSignal.timeout(4000) }
+      )
+      if (!res.ok) return []
+      const data = (await res.json()) as { refs?: MediaRef[] }
+      return (data.refs || []).map((r) => ({ ...r, url: absMediaUrl(r.url, baseUrl) }))
+    } catch {
+      return []
+    }
+  }
+
   static async fetchStatus(baseUrl: string = DEFAULT_SIDECAR_URL): Promise<SidecarStatus | null> {
     try {
       const res = await fetch(`${baseUrl.replace(/\/$/, '')}/status`, { signal: AbortSignal.timeout(2000) })

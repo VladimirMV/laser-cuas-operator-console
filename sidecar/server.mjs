@@ -274,9 +274,23 @@ async function refreshAndRing({ scan = false } = {}) {
   const already = ready.every((ch) => ringProcs[ch] && ringProcs[ch].exitCode == null)
   if (already && ringHot) return true
   stopRing()
+  wipeRing()
   startRing()
   if (ringHot) startLiveHarvest()
   return ringHot
+}
+
+function wipeRing() {
+  let n = 0
+  for (const ch of CHANNELS) {
+    const dir = ringDir(ch)
+    if (!fs.existsSync(dir)) continue
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.mp4')) continue
+      try { fs.unlinkSync(path.join(dir, f)); n++ } catch { /* */ }
+    }
+  }
+  if (n) console.log(`[sidecar] wiped ${n} stale ring mp4 (drop leftover testsrc)`)
 }
 
 function startRing() {
@@ -373,9 +387,9 @@ function harvestRing(sessionId, channels) {
     const dest = channelDir(sessionId, ch)
     ensureDir(dest)
     closed.forEach((item, i) => {
-      const key = `${sessionId}:${ch}:${item.file}:${item.size}`
+      const key = `${sessionId}:${ch}:${item.mtime}:${item.size}:${item.file}`
       if (harvested.has(key)) return
-      const name = `seg_${String(i).padStart(4, '0')}_${item.file}`
+      const name = `seg_${Date.now()}_${String(i).padStart(3, '0')}_${item.file}`
       const to = path.join(dest, name)
       if (!remuxCopy(item.path, to)) return
       harvested.add(key)
@@ -416,7 +430,7 @@ function ringIndex() {
         kind: 'SEGMENT',
         codec: 'h264',
         container: 'mp4',
-        url: `/media/${rel}`,
+        url: `/media/${rel}?v=${Math.floor(item.mtime)}`,
         path: rel,
       })
     })
@@ -452,10 +466,8 @@ function copyPreroll(sessionId, channels, prerollSec) {
       const t = i * RING_SEG * 1000
       const name = `preroll_${String(i).padStart(2, '0')}_t${String(t).padStart(6, '0')}.mp4`
       const to = path.join(dest, name)
-      try {
-        fs.copyFileSync(item.path, to)
-      } catch (e) {
-        console.warn(`[sidecar] preroll copy ${ch}: ${e.message}`)
+      if (!remuxCopy(item.path, to)) {
+        console.warn(`[sidecar] preroll remux failed ${ch} ${item.file}`)
         return
       }
       const rel = path.relative(MEDIA_ROOT, to).replace(/\\/g, '/')
@@ -692,13 +704,15 @@ async function handleStop() {
   if (!recording) return { ok: false, message: 'Not recording', refs: [] }
   if (globalThis.__recHarvest) { clearInterval(globalThis.__recHarvest); globalThis.__recHarvest = null }
   const snap = recording
-  for (const p of ffmpegProcs) {
-    try {
-      p.stdin?.write('q')
-      p.stdin?.end()
-    } catch { /* */ }
+  if (!snap.copyMode) {
+    for (const p of ffmpegProcs) {
+      try {
+        p.stdin?.write('q')
+        p.stdin?.end()
+      } catch { /* */ }
+    }
+    await new Promise((r) => setTimeout(r, 2500))
   }
-  await new Promise((r) => setTimeout(r, 2500))
   for (const p of ffmpegProcs) {
     try { if (!p.killed && p.exitCode == null) p.kill('SIGKILL') } catch { /* */ }
   }
@@ -898,6 +912,7 @@ function serveStatic(req, res, urlPath) {
       ...CORS,
       'Content-Type': type,
       'Accept-Ranges': 'bytes',
+      'Cache-Control': 'no-store',
       'Content-Range': `bytes ${start}-${end}/${st.size}`,
       'Content-Length': end - start + 1,
     })
@@ -907,6 +922,7 @@ function serveStatic(req, res, urlPath) {
     ...CORS,
     'Content-Type': type,
     'Accept-Ranges': 'bytes',
+    'Cache-Control': 'no-store',
     'Content-Length': st.size,
   })
   fs.createReadStream(file).pipe(res)
@@ -970,6 +986,18 @@ const server = http.createServer(async (req, res) => {
     }
     if (method === 'GET' && url.pathname === '/ring/index') {
       return json(res, 200, { ok: true, ringHot, files: ringIndex() })
+    }
+    if (method === 'GET' && url.pathname.startsWith('/sessions/') && url.pathname.endsWith('/index')) {
+      const id = decodeURIComponent(url.pathname.slice('/sessions/'.length, -'/index'.length))
+      const idx = path.join(sessionDir(id), 'media_index.jsonl')
+      const refs = []
+      if (fs.existsSync(idx)) {
+        for (const line of fs.readFileSync(idx, 'utf8').split(/\n/)) {
+          if (!line.trim()) continue
+          try { refs.push(JSON.parse(line)) } catch { /* */ }
+        }
+      }
+      return json(res, 200, { ok: true, sessionId: id, refs })
     }
     if (method === 'POST' && url.pathname === '/discover') {
       const body = await readBody(req).catch(() => ({}))

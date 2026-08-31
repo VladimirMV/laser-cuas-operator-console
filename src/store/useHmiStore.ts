@@ -246,8 +246,8 @@ const initialTarget: TargetData = {
   omegaAz: 0.35,
   omegaEl: -0.12,
   classification: 'FPV DRONE',
-  trackQuality: 94,
-  trackState: 'TRACKING',
+  trackQuality: 0,
+  trackState: 'SEARCH',
   coastTimer: 0,
   posX: 50,
   posY: 50,
@@ -398,7 +398,7 @@ export const useHmiStore = create<HmiStore>((set, get) => ({
   laserStatus: 'SAFE',
   calibrationStatus: 'VALID',
   mode: 'MANUAL',
-  automation: 'TRACKING',
+  automation: 'SEARCHING',
   activeCamera: 'LONG',
   zoom: 4.2,
   screen: 'COMBAT',
@@ -929,7 +929,7 @@ export const useHmiStore = create<HmiStore>((set, get) => ({
     set({
       laserStatus: 'SAFE',
       armConfirm: false,
-      automation: 'SEARCHING',
+      automation: 'TRACKING',
       aiActiveId: null,
       target: {
         ...t,
@@ -953,9 +953,32 @@ export const useHmiStore = create<HmiStore>((set, get) => ({
   },
 
   toggleTrackAtAim: (source = 'UI') => {
-    const t = get().target
-    if (t && (t.trackState === 'TRACKING' || t.trackState === 'COAST')) {
+    const st = get()
+    const t = st.target
+    const locked = Boolean(
+      (t && (t.trackState === 'TRACKING' || t.trackState === 'COAST'))
+      || st.aiTracking
+      || st.aiActiveId
+    )
+    if (locked) {
       get().dropTrack(source)
+      void get().stopAiDetect()
+      set({ aiTargets: [], aiActiveId: null, aiTracking: false })
+      return
+    }
+    const boxes = st.aiTargets
+    if (boxes.length) {
+      const nearest = boxes.slice().sort((a, b) => {
+        const da = Math.hypot(a.leftPct + a.widthPct / 2 - 50, a.topPct + a.heightPct / 2 - 50)
+        const db = Math.hypot(b.leftPct + b.widthPct / 2 - 50, b.topPct + b.heightPct / 2 - 50)
+        return da - db
+      })[0]
+      get().selectAiBox(nearest.id)
+      set({ aiTracking: true })
+      get().showToast(
+        st.lang === 'ua' ? `Захват ШІ ${nearest.type || nearest.id}` : `AI lock ${nearest.type || nearest.id}`,
+        'ok'
+      )
       return
     }
     get().markTargetAtAim(source)
@@ -1170,23 +1193,10 @@ export const useHmiStore = create<HmiStore>((set, get) => ({
       })()
       return
     }
-    // stop
+    // stop — keep the same archive session id that start() used
     const started = st.recordingStartedAt ?? Date.now()
     const durationSec = Math.max(1, Math.round((Date.now() - started) / 1000))
-    void getMediaRecorder().stop()
-    const sessionEvents = st.eventLog.filter((e) => new Date(e.ts).getTime() >= started)
-    const id = `SES-${new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '')}`
-    const rec: SessionRecord = {
-      id,
-      startedAt: new Date(started).toISOString(),
-      endedAt: new Date().toISOString(),
-      durationSec,
-      channels: [...st.recordingChannels],
-      events: sessionEvents.length,
-      note: `REC ${st.recordingChannels.join('+')} · ${st.recordingProfile.codec}`,
-      recording: false,
-      eventLog: sessionEvents,
-    }
+    const sid = archiveMock.getActiveSessionId()
     get().logEvent('REC_STOP', `REC stop ${st.recordingChannels.join('+')}`, 'UI', {
       channels: st.recordingChannels.join(','),
       codec_actual: st.recordingActualCodec,
@@ -1195,9 +1205,27 @@ export const useHmiStore = create<HmiStore>((set, get) => ({
     set({
       recording: false,
       recordingStartedAt: null,
-      sessions: [rec, ...st.sessions],
-      recordingActualCodec: 'meta',
+      recordingActualCodec: st.recordingActualCodec === 'meta' ? 'meta' : st.recordingActualCodec,
     })
+    void (async () => {
+      try {
+        const refs = await getMediaRecorder().stop()
+        if (sid) {
+          for (const r of refs) {
+            archiveMock.attachMediaRef({ ...r, session_id: sid })
+          }
+          archiveMock.stopSession(sid)
+        }
+        get().showToast(
+          get().lang === 'ua'
+            ? `Сесія ${sid || ''} · ${refs.length} файлів`
+            : `Session ${sid || ''} · ${refs.length} files`,
+          'ok'
+        )
+      } catch (e) {
+        get().showToast(e instanceof Error ? e.message : String(e), 'error')
+      }
+    })()
   },
   stopRecording: () => {
     if (get().recording) get().toggleRecording()
@@ -1299,6 +1327,13 @@ export const useHmiStore = create<HmiStore>((set, get) => ({
         }))
       )
     }
+    try {
+      const liveRefs = await HttpMediaRecorder.fetchSessionIndex('LIVE')
+      if (liveRefs.length) {
+        archiveMock.ensureNamedSession('LIVE', 'Continuous H.264 from cameras', ['LONG', 'IR'])
+        archiveMock.replaceSessionMedia('LIVE', liveRefs)
+      }
+    } catch { /* sidecar older than this build */ }
     if (st.ringHot && !get().recording && !autoRecStarted) {
       autoRecStarted = true
       get().toggleRecording()

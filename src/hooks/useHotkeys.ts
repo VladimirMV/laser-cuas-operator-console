@@ -21,6 +21,7 @@ export function useHotkeys() {
     openMaintenance,
     loseTrack,
     reacquire,
+    toggleTrackAtAim,
     toggleLang,
     armConfirm,
     setArmConfirm,
@@ -126,8 +127,7 @@ export function useHotkeys() {
 
       if (lower === 't') {
         e.preventDefault()
-        if (target?.trackState === 'TRACKING') loseTrack()
-        else reacquire()
+        toggleTrackAtAim()
         return
       }
 
