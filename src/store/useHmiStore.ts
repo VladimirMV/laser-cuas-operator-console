@@ -199,6 +199,8 @@ interface HmiStore {
   stopAiDetect: () => Promise<void>
   selectAiBox: (id: string) => void
   markTargetAtAim: (source?: EventSource) => void
+  dropTrack: (source?: EventSource) => void
+  toggleTrackAtAim: (source?: EventSource) => void
   setTurretLink: (l: TurretLinkStatus) => void
   applyTurretTelemetry: (t: {
     pan: number
@@ -918,6 +920,45 @@ export const useHmiStore = create<HmiStore>((set, get) => ({
       get().lang === 'ua' ? 'Ціль відмічено' : 'Target marked',
       'info'
     )
+  },
+
+  dropTrack: (source = 'UI') => {
+    const t = get().target
+    if (!t || t.trackState === 'LOST' || t.trackState === 'SEARCH') return
+    if (get().laserStatus === 'FIRING') get().fireEnd(source)
+    set({
+      laserStatus: 'SAFE',
+      armConfirm: false,
+      automation: 'SEARCHING',
+      aiActiveId: null,
+      target: {
+        ...t,
+        trackState: 'LOST',
+        trackQuality: 0,
+        coastTimer: 0,
+        omegaAz: 0,
+        omegaEl: 0,
+      },
+    })
+    get().ensureArchiveSession()
+    get().snapshotRecording('TRACK_LOST')
+    get().logEvent('TRACK_LOST', 'Track dropped by operator', source, {
+      az: t.azimuth,
+      el: t.elevation,
+    })
+    get().showToast(
+      get().lang === 'ua' ? 'Трекінг скинуто' : 'Tracking dropped',
+      'warn'
+    )
+  },
+
+  toggleTrackAtAim: (source = 'UI') => {
+    const t = get().target
+    if (t && (t.trackState === 'TRACKING' || t.trackState === 'COAST')) {
+      get().dropTrack(source)
+      return
+    }
+    get().markTargetAtAim(source)
   },
 
   slewTurret: (dAz, dEl) => {

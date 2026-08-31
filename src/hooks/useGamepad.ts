@@ -10,7 +10,8 @@
  *   LT          — cycle cameras
  *   RT          — cycle laser panel SAFE → ARM → FIRE
  *   LB          — AI overlay
- *   RB / A      — capture target
+ *   RB          — capture / drop tracking
+ *   A           — capture target
  *   B           — SAFE
  */
 import { useEffect, useRef } from 'react'
@@ -123,7 +124,11 @@ export function useGamepad() {
         cycleLaserPanel()
       }
 
-      if (edgeOnce('RB', pressed(gp.buttons[5])) || edgeOnce('A', pressed(gp.buttons[0]))) {
+      if (edgeOnce('RB', pressed(gp.buttons[5]))) {
+        store.toggleTrackAtAim('GAMEPAD')
+      }
+
+      if (edgeOnce('A', pressed(gp.buttons[0]))) {
         store.markTargetAtAim('GAMEPAD')
       }
 
