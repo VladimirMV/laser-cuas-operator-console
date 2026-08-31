@@ -1,15 +1,14 @@
 #!/usr/bin/env node
 /**
  * Zero-native-addon static server for the prebuilt HMI (dist/).
- * Uses only Node stdlib — no Vite, esbuild, or Rollup.
- *   node serve-dist.mjs
+ * Prefer:  node start.mjs
  */
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const root = path.join(path.dirname(fileURLToPath(import.meta.url)), 'dist')
+const dist = path.resolve(path.join(path.dirname(fileURLToPath(import.meta.url)), 'dist'))
 const port = Number(process.env.PORT || 5173)
 const host = process.env.HOST || '127.0.0.1'
 
@@ -25,36 +24,39 @@ const mime = {
   '.map': 'application/json',
 }
 
-if (!fs.existsSync(path.join(root, 'index.html'))) {
-  console.error('dist/index.html not found. Run this from the project root after a build.')
+if (!fs.existsSync(path.join(dist, 'index.html'))) {
+  console.error('dist/index.html not found.')
   process.exit(1)
+}
+
+function safeFile(urlPath) {
+  let rel = decodeURIComponent((urlPath || '/').split('?')[0]).replace(/^\/+/, '')
+  if (!rel || rel.endsWith('/')) rel += 'index.html'
+  if (rel.split(/[/\\]/).includes('..')) return null
+  const abs = path.resolve(dist, rel)
+  if (abs !== dist && !abs.startsWith(dist + path.sep)) return null
+  return abs
 }
 
 http
   .createServer((req, res) => {
-    const url = new URL(req.url || '/', `http://${host}`)
-    let rel = decodeURIComponent(url.pathname)
-    if (rel === '/' || rel.endsWith('/')) rel = path.join(rel, 'index.html')
-    const file = path.normalize(path.join(root, rel))
-    if (!file.startsWith(root)) {
+    const file = safeFile(req.url || '/')
+    if (!file) {
       res.writeHead(403)
-      res.end('forbidden')
-      return
+      return res.end('forbidden')
     }
     fs.readFile(file, (err, data) => {
       if (err) {
         res.writeHead(404, { 'content-type': 'text/plain' })
-        res.end('not found')
-        return
+        return res.end('not found')
       }
-      res.writeHead(200, { 'content-type': mime[path.extname(file)] || 'application/octet-stream' })
+      res.writeHead(200, { 'content-type': mime[path.extname(file).toLowerCase()] || 'application/octet-stream' })
       res.end(data)
     })
   })
   .on('error', (err) => {
     if (err && err.code === 'EADDRINUSE') {
-      console.error('Port ' + port + ' busy. Close the other HMI window or run:')
-      console.error('  set PORT=5174&& node serve-dist.mjs')
+      console.error('Port ' + port + ' busy. Close other node.exe in Task Manager.')
       process.exit(1)
     }
     console.error(err)
