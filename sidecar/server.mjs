@@ -1181,14 +1181,51 @@ function listSessions() {
   return out.sort((a, b) => b.id.localeCompare(a.id))
 }
 
-function serveStatic(req, res, urlPath) {
-  const rel = decodeURIComponent(urlPath.replace(/^\/media\/?/, ''))
-  const file = path.normalize(path.join(MEDIA_ROOT, rel))
-  if (!file.startsWith(MEDIA_ROOT)) {
-    res.writeHead(403, CORS)
-    return res.end('Forbidden')
+function insideMediaRoot(file) {
+  const a = path.resolve(file)
+  const b = path.resolve(MEDIA_ROOT)
+  const A = process.platform === 'win32' ? a.toLowerCase() : a
+  const B = process.platform === 'win32' ? b.toLowerCase() : b
+  const sep = path.sep
+  return A === B || A.startsWith(B + sep)
+}
+
+function walkFind(dir, basename, depth = 0) {
+  if (depth > 6 || !fs.existsSync(dir)) return null
+  let ents
+  try { ents = fs.readdirSync(dir, { withFileTypes: true }) } catch { return null }
+  for (const ent of ents) {
+    const p = path.join(dir, ent.name)
+    if (ent.isFile() && ent.name === basename) return p
   }
-  if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) {
+  for (const ent of ents) {
+    if (!ent.isDirectory()) continue
+    const hit = walkFind(path.join(dir, ent.name), basename, depth + 1)
+    if (hit) return hit
+  }
+  return null
+}
+
+function resolveMediaFile(urlPath) {
+  let rel = decodeURIComponent(String(urlPath || '').replace(/^\/media\/?/i, ''))
+  rel = rel.replace(/\\/g, '/').replace(/^\/+/, '')
+  if (!rel || rel.split('/').includes('..')) return null
+  const direct = path.resolve(MEDIA_ROOT, ...rel.split('/'))
+  if (insideMediaRoot(direct) && fs.existsSync(direct) && fs.statSync(direct).isFile()) return direct
+  const base = path.basename(rel)
+  if (!base || base === rel) return null
+  const hit = walkFind(MEDIA_ROOT, base)
+  if (hit && insideMediaRoot(hit)) {
+    console.log(`[sidecar] media alias ${rel} → ${path.relative(MEDIA_ROOT, hit)}`)
+    return hit
+  }
+  return null
+}
+
+function serveStatic(req, res, urlPath) {
+  const file = resolveMediaFile(urlPath)
+  if (!file) {
+    console.warn(`[sidecar] media 404 ${urlPath}`)
     res.writeHead(404, CORS)
     return res.end('Not found')
   }
@@ -1203,6 +1240,15 @@ function serveStatic(req, res, urlPath) {
     '.txt': 'text/plain',
   }
   const type = types[ext] || 'application/octet-stream'
+  if (req.method === 'HEAD') {
+    res.writeHead(200, {
+      ...CORS,
+      'Content-Type': type,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': st.size,
+    })
+    return res.end()
+  }
   const range = req.headers.range
   if (range) {
     const m = /bytes=(\d*)-(\d*)/.exec(range)
@@ -1373,7 +1419,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { ...CORS, 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400' })
       return fs.createReadStream(file).pipe(res)
     }
-    if (method === 'GET' && url.pathname.startsWith('/media/')) {
+    if ((method === 'GET' || method === 'HEAD') && url.pathname.startsWith('/media/')) {
       return serveStatic(req, res, url.pathname)
     }
     json(res, 404, { ok: false, message: 'Not found' })
