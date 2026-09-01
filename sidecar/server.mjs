@@ -926,6 +926,7 @@ async function handleStart(body) {
 
   if (ringHot) {
     refs.push(...harvestRing(sessionId, channels))
+    refs.push(...cloneLiveIntoSession(sessionId, channels))
     if (globalThis.__recHarvest) clearInterval(globalThis.__recHarvest)
     globalThis.__recHarvest = setInterval(() => {
       try {
@@ -1227,18 +1228,89 @@ function walkFind(dir, basename, depth = 0) {
   return null
 }
 
+function latestLiveFile(ch) {
+  const n = String(ch || '').toUpperCase() === 'IR' ? 'ir' : 'long'
+  const dirs = [
+    path.join(MEDIA_ROOT, 'LIVE', 'media', n),
+    path.join(MEDIA_ROOT, 'play', n),
+  ]
+  let best = null
+  for (const dir of dirs) {
+    if (!fs.existsSync(dir)) continue
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.toLowerCase().endsWith('.mp4')) continue
+      const fp = path.join(dir, f)
+      let st
+      try { st = fs.statSync(fp) } catch { continue }
+      if (!st.isFile() || st.size < 4096) continue
+      if (!best || st.mtimeMs > best.mtime) best = { path: fp, mtime: st.mtimeMs }
+    }
+  }
+  return best ? best.path : null
+}
+
+function cloneLiveIntoSession(sessionId, channels) {
+  const refs = []
+  if (!sessionId || sessionId === 'LIVE') return refs
+  for (const ch of channels) {
+    const liveDir = channelDir('LIVE', ch)
+    const dest = channelDir(sessionId, ch)
+    if (!fs.existsSync(liveDir)) continue
+    ensureDir(dest)
+    for (const f of fs.readdirSync(liveDir)) {
+      if (!f.toLowerCase().endsWith('.mp4')) continue
+      const from = path.join(liveDir, f)
+      const to = path.join(dest, f)
+      if (fs.existsSync(to) && fs.statSync(to).size > 4096) continue
+      try { fs.copyFileSync(from, to) } catch { continue }
+      if (!fs.existsSync(to) || fs.statSync(to).size < 4096) continue
+      const rel = path.relative(MEDIA_ROOT, to).replace(/\\/g, '/')
+      const ref = {
+        id: `MED-clone-${sessionId}-${ch}-${f}`,
+        ts_utc: new Date().toISOString(),
+        t_mono_ms: 0,
+        session_id: sessionId,
+        channel: ch,
+        kind: 'SEGMENT',
+        label: `${ch} ${f}`,
+        codec: 'h264',
+        container: 'mp4',
+        duration_ms: RING_SEG * 1000,
+        path: rel,
+        url: `/media/${rel}`,
+      }
+      refs.push(ref)
+      appendIndex(sessionId, ref)
+      console.log(`[sidecar] clone LIVE→${sessionId} ${ch} ${f} ${fs.statSync(to).size}B`)
+    }
+  }
+  return refs
+}
+
 function resolveMediaFile(urlPath) {
   let rel = decodeURIComponent(String(urlPath || '').replace(/^\/media\/?/i, ''))
-  rel = rel.replace(/\\/g, '/').replace(/^\/+/, '')
+  rel = rel.replace(/\\/g, '/').replace(/^\/+/, '').replace(/\?.*$/, '')
   if (!rel || rel.split('/').includes('..')) return null
-  const direct = path.resolve(MEDIA_ROOT, ...rel.split('/'))
+  const latest = rel.match(/^latest\/(long|ir)\.mp4$/i)
+  if (latest) return latestLiveFile(latest[1])
+  const parts = rel.split('/').filter(Boolean)
+  const direct = path.resolve(MEDIA_ROOT, ...parts)
   if (insideMediaRoot(direct) && fs.existsSync(direct) && fs.statSync(direct).isFile()) return direct
   const base = path.basename(rel)
-  if (!base || base === rel) return null
-  const hit = walkFind(MEDIA_ROOT, base)
-  if (hit && insideMediaRoot(hit)) {
-    console.log(`[sidecar] media alias ${rel} → ${path.relative(MEDIA_ROOT, hit)}`)
-    return hit
+  if (base && base !== rel) {
+    const hit = walkFind(MEDIA_ROOT, base)
+    if (hit && insideMediaRoot(hit)) {
+      console.log(`[sidecar] media alias ${rel} → ${path.relative(MEDIA_ROOT, hit)}`)
+      return hit
+    }
+  }
+  const chMatch = rel.match(/(?:^|\/)(long|ir)(?:\/|\.mp4$)/i)
+  if (chMatch) {
+    const live = latestLiveFile(chMatch[1])
+    if (live) {
+      console.log(`[sidecar] media 404 ${rel} → LIVE ${chMatch[1]}`)
+      return live
+    }
   }
   return null
 }

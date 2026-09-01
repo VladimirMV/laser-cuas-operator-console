@@ -12,6 +12,7 @@ import { cn } from '../lib/utils'
 import type { ArchiveEvent, MediaRef, SessionBundle } from '../types/archive'
 import type { CameraChannel } from '../types/hmi'
 import { archiveMock } from '../adapters/archive'
+import { DEFAULT_SIDECAR_URL } from '../adapters/mediaRecorder'
 import { ReplayCanvas } from './ReplayCanvas'
 import { eventColor, eventMarker, fmtClock, hudFromBundle } from '../lib/replayHud'
 
@@ -43,6 +44,8 @@ function ReplayFeed({
   const [broken, setBroken] = useState(false)
   const seg = hud ? segmentFor(bundle, channel, playhead) : null
   const url = seg?.url
+  const fallback = `${DEFAULT_SIDECAR_URL}/media/latest/${channel}.mp4`
+  const src = !broken && url ? url : fallback
   useEffect(() => { setBroken(false) }, [url])
   useEffect(() => {
     const el = vid.current
@@ -54,31 +57,24 @@ function ReplayFeed({
   }, [playhead, url, seg])
   useEffect(() => {
     const el = vid.current
-    if (!el || !url) return
+    if (!el || !src) return
     const play = () => { void el.play().catch(() => undefined) }
     el.addEventListener('loadeddata', play)
     play()
     return () => el.removeEventListener('loadeddata', play)
-  }, [url])
+  }, [src])
   return (
     <div className={className}>
-      {url && !broken && (
-        <video
+      <video
           ref={vid}
-          src={url}
+          src={src}
           muted
           playsInline
           autoPlay
-          onError={() => setBroken(true)}
+          onError={() => { if (!broken && url) setBroken(true) }}
           className="absolute inset-0 h-full w-full object-cover bg-black"
         />
-      )}
-      <ReplayCanvas channel={channel} hud={hud!} t={playhead} hasVideo={!!url && !broken} className="absolute inset-0 h-full w-full pointer-events-none" />
-      {(!url || broken) && (
-        <div className="absolute bottom-3 left-3 z-10 font-mono text-[10px] tracking-widest text-[#F85149] bg-black/70 px-2 py-1">
-          {broken ? 'VIDEO FILE NOT PLAYABLE' : 'NO VIDEO FILE — press REC, wait 10s, open RING or LIVE'}
-        </div>
-      )}
+      <ReplayCanvas channel={channel} hud={hud!} t={playhead} hasVideo className="absolute inset-0 h-full w-full pointer-events-none" />
     </div>
   )
 }
@@ -108,8 +104,10 @@ export function ArchiveWorkspace() {
   useEffect(() => {
     refresh()
     const list = listArchiveSessions()
+    const live = list.find((s) => s.id === 'LIVE')
     const ring = list.find((s) => s.id === 'RING')
-    if (ring && sidecarConnected) setSelectedId('RING')
+    if (live && sidecarConnected) setSelectedId('LIVE')
+    else if (ring && sidecarConnected) setSelectedId('RING')
   }, [sidecarConnected, ringHot])
   const bundle: SessionBundle | null = useMemo(
     () => (selectedId ? getArchiveBundle(selectedId) : null),
