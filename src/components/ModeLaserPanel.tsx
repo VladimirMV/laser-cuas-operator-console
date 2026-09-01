@@ -7,11 +7,16 @@ export function ModeLaserPanel() {
   const {
     mode, setMode, automation,
     laserStatus, arm, confirmArm, safe, fireStart, fireEnd,
-    target, armConfirm, setArmConfirm,
+    target, armConfirm, setArmConfirm, aiTracking,
   } = useHmiStore()
   const { t } = useT()
 
-  const canArm = laserStatus === 'SAFE' && target?.trackState === 'TRACKING'
+  const canArm =
+    laserStatus === 'SAFE' &&
+    (target?.trackState === 'TRACKING' ||
+      target?.trackState === 'COAST' ||
+      mode === 'MANUAL' ||
+      aiTracking)
   const canFire = laserStatus === 'ARMED'
 
   const autoColor =

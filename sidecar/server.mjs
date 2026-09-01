@@ -559,7 +559,7 @@ function wipeRing() {
     const dir = ringDir(ch)
     if (!fs.existsSync(dir)) continue
     for (const f of fs.readdirSync(dir)) {
-      if (!f.endsWith('.mp4')) continue
+      if (!(/\.(mp4|ts)$/i.test(f))) continue
       try { fs.unlinkSync(path.join(dir, f)); n++ } catch { /* */ }
     }
   }
@@ -577,7 +577,7 @@ function startRing() {
   for (const ch of CHANNELS) {
     const dir = ringDir(ch)
     ensureDir(dir)
-    const pattern = ffPath(path.join(dir, 'r_%02d.mp4'))
+    const pattern = ffPath(path.join(dir, 'r_%02d.ts'))
     ensureDir(previewDir())
     const src = inputArgs(ch)
     const fromUrl = src.fromUrl
@@ -608,7 +608,7 @@ function startRing() {
       '-segment_time', String(RING_SEG),
       '-segment_wrap', String(RING_WRAP),
       '-reset_timestamps', '1',
-      '-segment_format_options', 'movflags=+faststart',
+      '-segment_format', 'mpegts',
       pattern,
       '-map', '[vprev]', '-an',
       '-q:v', '5',
@@ -636,32 +636,38 @@ function listRingFiles(ch) {
   if (!fs.existsSync(dir)) return []
   return fs
     .readdirSync(dir)
-    .filter((f) => f.endsWith('.mp4'))
+    .filter((f) => /\.(ts|mp4)$/i.test(f))
     .map((f) => {
       const p = path.join(dir, f)
       const st = fs.statSync(p)
       return { file: f, path: p, mtime: st.mtimeMs, size: st.size }
     })
-    .filter((x) => x.size > 1024)
+    .filter((x) => x.size > 4096)
     .sort((a, b) => a.mtime - b.mtime)
 }
 
 function remuxCopy(from, to) {
-  try {
-    execFileSync(
-      ffmpegBin,
-      ['-y', '-hide_banner', '-loglevel', 'error', '-i', from, '-c', 'copy', '-movflags', '+faststart', to],
-      { timeout: 25000 }
-    )
-    return fs.existsSync(to) && fs.statSync(to).size > 512
-  } catch {
+  ensureDir(path.dirname(to))
+  const run = (args) => {
     try {
-      fs.copyFileSync(from, to)
-      return true
-    } catch {
+      execFileSync(ffmpegBin, args, { timeout: 30000, stdio: ['ignore', 'ignore', 'pipe'] })
+      return fs.existsSync(to) && fs.statSync(to).size > 4096
+    } catch (e) {
+      try {
+        if (fs.existsSync(to) && fs.statSync(to).size < 4096) fs.unlinkSync(to)
+      } catch { /* */ }
       return false
     }
   }
+  if (run(['-y', '-hide_banner', '-loglevel', 'error', '-fflags', '+genpts', '-i', from, '-c', 'copy', '-an', '-movflags', '+faststart', to])) {
+    return true
+  }
+  if (run(['-y', '-hide_banner', '-loglevel', 'error', '-fflags', '+genpts', '-i', from, '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-an', '-movflags', '+faststart', to])) {
+    console.log(`[sidecar] remux transcode ${path.basename(from)} → ${path.basename(to)}`)
+    return true
+  }
+  console.warn(`[sidecar] remux FAIL ${from}`)
+  return false
 }
 
 const harvested = new Set()
@@ -676,9 +682,14 @@ function harvestRing(sessionId, channels) {
     closed.forEach((item, i) => {
       const key = `${sessionId}:${ch}:${item.mtime}:${item.size}:${item.file}`
       if (harvested.has(key)) return
-      const name = `seg_${Date.now()}_${String(i).padStart(3, '0')}_${item.file}`
+      const stem = String(item.file).replace(/\.(ts|mp4)$/i, '')
+      const name = `seg_${Date.now()}_${String(i).padStart(3, '0')}_${stem}.mp4`
       const to = path.join(dest, name)
-      if (!remuxCopy(item.path, to)) return
+      if (!remuxCopy(item.path, to)) {
+        console.warn(`[sidecar] harvest skip ${ch} ${item.file}`)
+        return
+      }
+      console.log(`[sidecar] harvest ${sessionId} ${ch} ${name} ${fs.statSync(to).size}B`)
       harvested.add(key)
       const rel = path.relative(MEDIA_ROOT, to).replace(/\\/g, '/')
       const ref = {
@@ -705,13 +716,23 @@ function harvestRing(sessionId, channels) {
 function ringIndex() {
   const out = []
   for (const ch of CHANNELS) {
-    listRingFiles(ch).forEach((item, i) => {
-      const rel = path.relative(MEDIA_ROOT, item.path).replace(/\\/g, '/')
+    const files = listRingFiles(ch)
+    const closed = files.length > 1 ? files.slice(0, -1) : files
+    closed.forEach((item, i) => {
+      const playDir = path.join(MEDIA_ROOT, 'play', ch.toLowerCase())
+      ensureDir(playDir)
+      const stem = String(item.file).replace(/\.(ts|mp4)$/i, '')
+      const dest = path.join(playDir, stem + '.mp4')
+      if (!fs.existsSync(dest) || fs.statSync(dest).mtimeMs < item.mtime) {
+        remuxCopy(item.path, dest)
+      }
+      if (!fs.existsSync(dest) || fs.statSync(dest).size < 4096) return
+      const rel = path.relative(MEDIA_ROOT, dest).replace(/\\/g, '/')
       out.push({
-        id: `RING-${ch}-${item.file}`,
+        id: `RING-${ch}-${stem}`,
         channel: ch,
-        file: item.file,
-        size: item.size,
+        file: stem + '.mp4',
+        size: fs.statSync(dest).size,
         mtime: item.mtime,
         t_mono_ms: i * RING_SEG * 1000,
         kind: 'SEGMENT',

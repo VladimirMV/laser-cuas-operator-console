@@ -563,19 +563,33 @@ export const useHmiStore = create<HmiStore>((set, get) => ({
   },
 
   arm: (source = 'UI') => {
-    const { laserStatus, target } = get()
+    const { laserStatus, target, mode, aiTracking } = get()
     if (laserStatus !== 'SAFE') return
-    if (!target || target.trackState !== 'TRACKING') return
+    const locked =
+      (target && (target.trackState === 'TRACKING' || target.trackState === 'COAST')) ||
+      mode === 'MANUAL' ||
+      aiTracking
+    if (!locked) {
+      get().showToast(
+        get().lang === 'ua' ? 'ARM: немає треку — RB або AI ON' : 'ARM: no track — RB or AI ON',
+        'warn'
+      )
+      return
+    }
     set({ armConfirm: true, automation: 'WAITING_CONFIRM' })
   },
   confirmArm: (source = 'UI') => {
-    const { target } = get()
-    if (!target || target.trackState !== 'TRACKING') {
+    const { target, mode, aiTracking } = get()
+    const locked =
+      (target && (target.trackState === 'TRACKING' || target.trackState === 'COAST')) ||
+      mode === 'MANUAL' ||
+      aiTracking
+    if (!locked) {
       set({ armConfirm: false })
       return
     }
-    set({ laserStatus: 'ARMED', armConfirm: false, automation: 'TRACKING' })
-    get().logEvent('ARM', 'Laser ARMED', source, { range: target.range })
+    set({ laserStatus: 'ARMED', armConfirm: false, automation: target?.trackState === 'TRACKING' ? 'TRACKING' : get().automation })
+    get().logEvent('ARM', 'Laser ARMED', source, { range: target?.range ?? 0 })
     get().snapshotRecording('ARM')
   },
   safe: (source = 'UI') => {
