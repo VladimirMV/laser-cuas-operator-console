@@ -40,8 +40,10 @@ function ReplayFeed({
   className?: string
 }) {
   const vid = useRef<HTMLVideoElement>(null)
+  const [broken, setBroken] = useState(false)
   const seg = hud ? segmentFor(bundle, channel, playhead) : null
   const url = seg?.url
+  useEffect(() => { setBroken(false) }, [url])
   useEffect(() => {
     const el = vid.current
     if (!el || !url || !seg) return
@@ -60,17 +62,23 @@ function ReplayFeed({
   }, [url])
   return (
     <div className={className}>
-      {url && (
+      {url && !broken && (
         <video
           ref={vid}
           src={url}
           muted
           playsInline
           autoPlay
+          onError={() => setBroken(true)}
           className="absolute inset-0 h-full w-full object-cover bg-black"
         />
       )}
-      <ReplayCanvas channel={channel} hud={hud!} t={playhead} hasVideo={!!url} className="absolute inset-0 h-full w-full" />
+      <ReplayCanvas channel={channel} hud={hud!} t={playhead} hasVideo={!!url && !broken} className="absolute inset-0 h-full w-full pointer-events-none" />
+      {(!url || broken) && (
+        <div className="absolute bottom-3 left-3 z-10 font-mono text-[10px] tracking-widest text-[#F85149] bg-black/70 px-2 py-1">
+          {broken ? 'VIDEO FILE NOT PLAYABLE' : 'NO VIDEO FILE — press REC, wait 10s, open RING or LIVE'}
+        </div>
+      )}
     </div>
   )
 }

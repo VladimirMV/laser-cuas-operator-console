@@ -259,12 +259,21 @@ function previewDir() {
 function previewFile(ch) {
   return path.join(previewDir(), ch.toLowerCase() + '.jpg')
 }
+const previewCache = Object.create(null)
 function readPreviewJpeg(ch) {
   const f = previewFile(ch)
   try {
     const buf = fs.readFileSync(f)
-    if (buf.length > 800 && buf[0] === 0xff && buf[1] === 0xd8) return buf
-  } catch { /* not yet */ }
+    if (
+      buf.length > 800 &&
+      buf[0] === 0xff && buf[1] === 0xd8 &&
+      buf[buf.length - 2] === 0xff && buf[buf.length - 1] === 0xd9
+    ) {
+      previewCache[ch] = buf
+      return buf
+    }
+  } catch { /* ffmpeg rewriting the file */ }
+  if (previewCache[ch]) return previewCache[ch]
   return liveHubs[ch] && liveHubs[ch].lastJpeg ? liveHubs[ch].lastJpeg : null
 }
 
@@ -599,7 +608,7 @@ function startRing() {
       '-segment_time', String(RING_SEG),
       '-segment_wrap', String(RING_WRAP),
       '-reset_timestamps', '1',
-      '-segment_format_options', 'movflags=frag_keyframe+empty_moov+default_base_moof',
+      '-segment_format_options', 'movflags=+faststart',
       pattern,
       '-map', '[vprev]', '-an',
       '-q:v', '5',
@@ -849,29 +858,31 @@ function diskBytes() {
 }
 
 async function handleStart(body) {
-  if (recording) return { ok: false, message: 'Already recording', sessionId: recording.sessionId }
+  if (recording) {
+    return {
+      ok: true,
+      already: true,
+      sessionId: recording.sessionId,
+      channels: recording.channels,
+      codec_target: recording.codec,
+      codec_actual: recording.actualCodec,
+      encoder: recording.encoder,
+      mediaRoot: MEDIA_ROOT,
+      refs: recording.refs || [],
+    }
+  }
   if (!refreshFfmpeg()) return { ok: false, message: 'FFmpeg not available on side-car host. winget install Gyan.FFmpeg' }
-  await resolveChannelUrls({ scan: true })
   if (!ringHot) startRing()
 
   const sessionId = String(body.sessionId || `SES-${Date.now()}`)
   let channels = Array.isArray(body.channels) ? body.channels.map(String) : ['LONG', 'IR']
-  channels = channels.filter((c) => CHANNELS.includes(c))
+  channels = channels.filter((c) => c !== 'WIDE' && CHANNELS.includes(c))
+  if (!channels.length) channels = ['LONG', 'IR']
   if (!channels.length) return { ok: false, message: 'No valid channels' }
 
-  const wantCodec = body.codec === 'h264' ? 'h264' : 'h265'
-  const encoder = pickEncoder(wantCodec)
-  if (!encoder) return { ok: false, message: 'No suitable video encoder' }
-
-  for (const ch of channels) {
-    const u = liveUrl(ch)
-    if (u && /\.local([:/]|$)/i.test(u)) {
-      return {
-        ok: false,
-        message: 'Cannot resolve ' + u + ' (Windows mDNS). Put camera IP in sidecar/config.json, e.g. http://192.168.1.20/2k-stream',
-      }
-    }
-  }
+  const wantCodec = 'h264'
+  const encoder = pickEncoder('h264') || pickEncoder('h265')
+  if (!encoder && !ringHot) return { ok: false, message: 'No suitable video encoder' }
 
   const segmentDurationSec = Number(body.segmentDurationSec || config.segmentDurationSec || 15)
   const prerollSec = Number(body.prerollSec || DEFAULT_PREROLL)

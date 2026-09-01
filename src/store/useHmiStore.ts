@@ -53,7 +53,6 @@ import {
   activeChannelList,
 } from '../types/archive'
 
-let autoRecStarted = false
 
 interface HmiStore {
   systemStatus: SystemStatus
@@ -1324,9 +1323,12 @@ export const useHmiStore = create<HmiStore>((set, get) => ({
         archiveMock.replaceSessionMedia('LIVE', liveRefs)
       }
     } catch { /* sidecar older than this build */ }
-    if (st.ringHot && !get().recording && !autoRecStarted) {
-      autoRecStarted = true
-      get().toggleRecording()
+    const recSid = archiveMock.getActiveSessionId()
+    if (recSid && recSid !== 'LIVE' && recSid !== 'RING') {
+      try {
+        const sesRefs = await HttpMediaRecorder.fetchSessionIndex(recSid)
+        if (sesRefs.length) archiveMock.replaceSessionMedia(recSid, sesRefs)
+      } catch { /* */ }
     }
     set({
       sidecarConnected: true,

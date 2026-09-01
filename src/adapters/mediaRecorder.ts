@@ -185,6 +185,7 @@ function ingestRefs(refs: MediaRef[] | undefined, base: string) {
   if (!refs) return
   for (const ref of refs) {
     archiveMock.attachMediaRef({
+      session_id: ref.session_id,
       ts_utc: ref.ts_utc,
       t_mono_ms: ref.t_mono_ms,
       channel: ref.channel,
