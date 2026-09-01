@@ -44,8 +44,9 @@ function ReplayFeed({
   const [broken, setBroken] = useState(false)
   const seg = hud ? segmentFor(bundle, channel, playhead) : null
   const url = seg?.url
+  const liveBuf = bundle.session.id === 'LIVE' || bundle.session.id === 'RING'
   const fallback = `${DEFAULT_SIDECAR_URL}/media/latest/${channel}.mp4`
-  const src = !broken && url ? url : fallback
+  const src = url && !broken ? url : (liveBuf ? fallback : url || fallback)
   useEffect(() => { setBroken(false) }, [url])
   useEffect(() => {
     const el = vid.current

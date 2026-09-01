@@ -880,16 +880,25 @@ function diskBytes() {
 
 async function handleStart(body) {
   if (recording) {
+    const want = String(body.sessionId || recording.sessionId)
+    const chs = recording.channels || ['LONG', 'IR']
+    const extra = [
+      ...harvestRing(want, chs),
+      ...cloneLiveIntoSession(want, chs),
+    ]
+    recording.sessionId = want
+    recording.refs = [...(recording.refs || []), ...extra]
+    console.log(`[sidecar] REC already → hydrate ${want} +${extra.length} files`)
     return {
       ok: true,
       already: true,
-      sessionId: recording.sessionId,
-      channels: recording.channels,
+      sessionId: want,
+      channels: chs,
       codec_target: recording.codec,
       codec_actual: recording.actualCodec,
       encoder: recording.encoder,
       mediaRoot: MEDIA_ROOT,
-      refs: recording.refs || [],
+      refs: recording.refs,
     }
   }
   if (!refreshFfmpeg()) return { ok: false, message: 'FFmpeg not available on side-car host. winget install Gyan.FFmpeg' }
@@ -930,7 +939,10 @@ async function handleStart(body) {
     if (globalThis.__recHarvest) clearInterval(globalThis.__recHarvest)
     globalThis.__recHarvest = setInterval(() => {
       try {
-        const more = harvestRing(sessionId, channels)
+        const more = [
+          ...harvestRing(sessionId, channels),
+          ...cloneLiveIntoSession(sessionId, channels),
+        ]
         if (recording && more.length) recording.refs.push(...more)
       } catch { /* */ }
     }, RING_SEG * 1000)
@@ -1249,6 +1261,27 @@ function latestLiveFile(ch) {
   return best ? best.path : null
 }
 
+function matchLiveSegment(ch, filename) {
+  const ring = (String(filename).match(/r_(\d+)/i) || [])[1]
+  const ts = Number((String(filename).match(/seg_(\d+)/) || [])[1] || 0)
+  const dir = channelDir('LIVE', String(ch).toUpperCase() === 'IR' ? 'IR' : 'LONG')
+  if (!fs.existsSync(dir)) return null
+  let best = null
+  let bestDelta = Infinity
+  for (const f of fs.readdirSync(dir)) {
+    if (!f.toLowerCase().endsWith('.mp4')) continue
+    if (ring && !f.includes('_r_' + ring) && !f.includes('r_' + ring + '.mp4')) continue
+    const fp = path.join(dir, f)
+    let st
+    try { st = fs.statSync(fp) } catch { continue }
+    if (st.size < 4096) continue
+    const fts = Number((f.match(/seg_(\d+)/) || [])[1] || st.mtimeMs)
+    const d = ts ? Math.abs(fts - ts) : (Date.now() - st.mtimeMs)
+    if (d < bestDelta) { bestDelta = d; best = fp }
+  }
+  return best
+}
+
 function cloneLiveIntoSession(sessionId, channels) {
   const refs = []
   if (!sessionId || sessionId === 'LIVE') return refs
@@ -1304,16 +1337,26 @@ function resolveMediaFile(urlPath) {
       return hit
     }
   }
-  const chMatch = rel.match(/(?:^|\/)(long|ir)(?:\/|\.mp4$)/i)
-  if (chMatch) {
-    const live = latestLiveFile(chMatch[1])
-    if (live) {
-      console.log(`[sidecar] media 404 ${rel} → LIVE ${chMatch[1]}`)
-      return live
+  const ses = rel.match(/^(SES-[^/]+)\/media\/(long|ir)\/(.+\.mp4)$/i)
+  if (ses) {
+    const dest = path.resolve(MEDIA_ROOT, ...rel.split('/').filter(Boolean))
+    const src = matchLiveSegment(ses[2], ses[3]) || latestLiveFile(ses[2])
+    if (src) {
+      try {
+        ensureDir(path.dirname(dest))
+        if (!fs.existsSync(dest) || fs.statSync(dest).size < 4096) {
+          fs.copyFileSync(src, dest)
+          console.log(`[sidecar] freeze ${rel} ← ${path.basename(src)} ${fs.statSync(dest).size}B`)
+        }
+        if (fs.existsSync(dest) && fs.statSync(dest).size > 4096) return dest
+      } catch (e) {
+        console.warn('[sidecar] freeze fail', e.message || e)
+      }
     }
   }
   return null
 }
+
 
 function serveStatic(req, res, urlPath) {
   const file = resolveMediaFile(urlPath)
@@ -1452,13 +1495,55 @@ const server = http.createServer(async (req, res) => {
     }
     if (method === 'GET' && url.pathname.startsWith('/sessions/') && url.pathname.endsWith('/index')) {
       const id = decodeURIComponent(url.pathname.slice('/sessions/'.length, -'/index'.length))
+      if (id && id !== 'LIVE' && id !== 'RING') {
+        try {
+          harvestRing(id, ['LONG', 'IR'])
+          cloneLiveIntoSession(id, ['LONG', 'IR'])
+        } catch (e) {
+          console.warn('[sidecar] hydrate', e.message || e)
+        }
+      }
       const idx = path.join(sessionDir(id), 'media_index.jsonl')
       const refs = []
+      const seen = new Set()
       if (fs.existsSync(idx)) {
         for (const line of fs.readFileSync(idx, 'utf8').split(/\n/)) {
           if (!line.trim()) continue
-          try { refs.push(JSON.parse(line)) } catch { /* */ }
+          try {
+            const row = JSON.parse(line)
+            refs.push(row)
+            if (row.url) seen.add(row.url)
+          } catch { /* */ }
         }
+      }
+      for (const ch of ['LONG', 'IR']) {
+        const dir = channelDir(id, ch)
+        if (!fs.existsSync(dir)) continue
+        const files = fs.readdirSync(dir).filter((f) => f.toLowerCase().endsWith('.mp4')).sort()
+        files.forEach((f, i) => {
+          const fp = path.join(dir, f)
+          let st
+          try { st = fs.statSync(fp) } catch { return }
+          if (st.size < 4096) return
+          const rel = path.relative(MEDIA_ROOT, fp).replace(/\\/g, '/')
+          const url = '/media/' + rel
+          if (seen.has(url)) return
+          seen.add(url)
+          refs.push({
+            id: `MED-disk-${id}-${ch}-${f}`,
+            ts_utc: new Date(st.mtimeMs).toISOString(),
+            t_mono_ms: i * RING_SEG * 1000,
+            session_id: id,
+            channel: ch,
+            kind: 'SEGMENT',
+            label: `${ch} ${f}`,
+            codec: 'h264',
+            container: 'mp4',
+            duration_ms: RING_SEG * 1000,
+            path: rel,
+            url,
+          })
+        })
       }
       return json(res, 200, { ok: true, sessionId: id, refs })
     }
