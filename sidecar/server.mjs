@@ -583,7 +583,11 @@ function spawnLogged(bin, args, tag) {
   const proc = spawn(bin, args, { stdio: ['pipe', 'pipe', 'pipe'] })
   proc.stderr.on('data', (d) => {
     const s = d.toString().trim()
-    if (s) console.log(`[ffmpeg:${tag}] ${s}`)
+    if (s) {
+      console.log(`[ffmpeg:${tag}] ${s}`)
+      const ch = tag.split(':').pop()
+      if (ch) grabLog[ch] = { t: Date.now(), msg: s.slice(0, 500) }
+    }
   })
   proc.on('exit', (code, signal) => {
     console.log(`[sidecar] ${tag} exited code=${code} signal=${signal}`)
@@ -594,6 +598,12 @@ function spawnLogged(bin, args, tag) {
 /** @type {Record<string, import('node:child_process').ChildProcess>} */
 const ringProcs = {}
 let ringHot = false
+const grabLog = {}
+function noteGrab(ch, msg) {
+  const line = String(msg || '').slice(0, 500)
+  grabLog[ch] = { t: Date.now(), msg: line }
+  console.log(`[sidecar] ${ch} ${line}`)
+}
 
 function stopGrab(ch) {
   try { ringProcs[ch]?.kill('SIGKILL') } catch { /* */ }
@@ -671,15 +681,13 @@ function startGrab(ch, recOut) {
     return
   }
   const prev = ffPath(previewFile(ch))
-  const vf = 'fps=6'
   let args
   if (!recOut) {
     args = [
-      '-y', '-hide_banner', '-loglevel', 'warning',
+      '-y', '-hide_banner', '-loglevel', 'info',
       ...src.args,
       '-an', '-sn',
-      '-vf', vf,
-      '-q:v', '6',
+      '-q:v', '5',
       '-f', 'image2',
       '-update', '1',
       prev,
@@ -704,7 +712,8 @@ function startGrab(ch, recOut) {
       ffPath(recOut),
     ]
   }
-  console.log(`[sidecar] grab ${ch}${recOut ? '+REC' : ''} ← ${url}`)
+  noteGrab(ch, `spawn ${url} → ${prev}`)
+  console.log(`[sidecar] grab ${ch} ffmpeg ${args.join(' ')}`)
   const proc = spawnLogged(ffmpegBin, args, `grab:${ch}`)
   ringProcs[ch] = proc
   proc.on('exit', (code, signal) => {
@@ -1734,8 +1743,26 @@ const server = http.createServer(async (req, res) => {
         })
         return res.end(jpeg)
       }
-      res.writeHead(503, { ...CORS, 'Retry-After': '1' })
-      return res.end('no frame yet — camera hub warming up')
+      let previewBytes = 0
+      try {
+        const st = fs.statSync(previewFile(ch))
+        previewBytes = st.size
+      } catch { /* */ }
+      const proc = ringProcs[ch]
+      const body = JSON.stringify({
+        ok: false,
+        ch,
+        url: liveUrl(ch) || channelUrl(ch),
+        ffmpeg: ffmpegInfo.ok,
+        ffmpegBin,
+        grabAlive: Boolean(proc && proc.exitCode == null && !proc.killed),
+        pid: proc && proc.pid,
+        previewBytes,
+        preview: previewFile(ch),
+        last: grabLog[ch] || null,
+      })
+      res.writeHead(503, { ...CORS, 'Retry-After': '1', 'Content-Type': 'application/json' })
+      return res.end(body)
     }
     if (method === 'GET' && url.pathname.startsWith('/replay/')) {
       const parts = url.pathname.split('/').filter(Boolean)
@@ -1936,6 +1963,17 @@ server.listen(PORT, HOST, () => {
     console.log(`[sidecar] ${ch}: ${channelUrl(ch) || channelKind(ch)}`)
   }
   wipeRing()
+  const pin = {
+    LONG: (config.channels?.LONG?.url || 'http://192.168.80.238/2k-stream').trim(),
+    IR: (config.channels?.IR?.url || 'http://192.168.80.243/thermal/stream').trim(),
+  }
+  for (const ch of ['LONG', 'IR']) {
+    if (pin[ch] && !stillMdns(pin[ch])) {
+      resolvedUrls[ch] = pin[ch]
+      noteGrab(ch, `pinned ${pin[ch]}`)
+      startGrab(ch, null)
+    }
+  }
   void refreshAndRing({ scan: false }).then((ok) => {
     console.log(`[sidecar] ringHot=${ringHot} started=${ok}`)
   })

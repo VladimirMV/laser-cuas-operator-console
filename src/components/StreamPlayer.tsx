@@ -34,13 +34,12 @@ function JpegPoll({
   zoom: number
 }) {
   const [src, setSrc] = useState<string | null>(null)
-  const [direct, setDirect] = useState(false)
+  const [diag, setDiag] = useState('')
   const z = Math.max(1, zoom || 1)
 
   useEffect(() => {
     let stop = false
     let obj: string | null = null
-    let fails = 0
     const tick = async () => {
       if (stop) return
       try {
@@ -48,38 +47,36 @@ function JpegPoll({
         if (r.ok) {
           const blob = await r.blob()
           if (blob.size >= 256) {
-            fails = 0
-            setDirect(false)
+            setDiag('')
             const next = URL.createObjectURL(blob)
             if (obj) URL.revokeObjectURL(obj)
             obj = next
             setSrc(next)
-          } else fails++
+          }
         } else {
-          fails++
+          const txt = await r.text()
+          try {
+            const j = JSON.parse(txt) as { url?: string; grabAlive?: boolean; previewBytes?: number; last?: { msg?: string }; ffmpeg?: boolean }
+            setDiag([j.url, j.ffmpeg === false ? 'NO FFMPEG' : '', j.grabAlive ? 'grab ON' : 'grab OFF', j.previewBytes ? `${j.previewBytes}B` : '', j.last?.msg].filter(Boolean).join(' · '))
+          } catch {
+            setDiag(txt.slice(0, 180))
+          }
         }
-      } catch {
-        fails++
+      } catch (e) {
+        setDiag(e instanceof Error ? e.message : 'sidecar offline')
       }
-      if (!stop) window.setTimeout(tick, direct ? 2000 : 150)
+      if (!stop) window.setTimeout(tick, 200)
     }
     void tick()
     return () => {
       stop = true
       if (obj) URL.revokeObjectURL(obj)
     }
-  }, [url, fallbackUrl])
+  }, [url])
 
   return (
     <div className={cn('absolute inset-0 bg-black', className)}>
-      {false && fallbackUrl ? (
-        <img
-          src={fallbackUrl}
-          alt=""
-          className={cn('absolute inset-0 w-full h-full object-cover', thermalStyle && 'contrast-125')}
-          style={{ transform: `scale(${z})`, transformOrigin: 'center center' }}
-        />
-      ) : src ? (
+      {src ? (
         <img
           src={src}
           alt=""
@@ -87,8 +84,9 @@ function JpegPoll({
           style={{ transform: `scale(${z})`, transformOrigin: 'center center' }}
         />
       ) : (
-        <div className="absolute inset-0 flex items-center justify-center font-mono text-[10px] text-[#6E7681]">
-          WAITING CAMERA…
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-4 font-mono text-[10px] text-[#6E7681]">
+          <div>WAITING CAMERA…</div>
+          {diag && <div className="max-w-[90%] text-center text-[#F85149] leading-tight break-all">{diag}</div>}
         </div>
       )}
     </div>
