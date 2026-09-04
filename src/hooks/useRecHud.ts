@@ -32,7 +32,17 @@ function boxesFromStore() {
     }
   }
   const t = st.target
-  if (t && t.trackState !== 'SEARCH' && t.trackState !== 'LOST') {
+  if (!t || t.trackState === 'SEARCH' || t.trackState === 'LOST') {
+    boxes.push({
+      x: 0.5 - 56 / AI_CAM_W,
+      y: 0.5 - 56 / AI_CAM_H,
+      w: 112 / AI_CAM_W,
+      h: 112 / AI_CAM_H,
+      color: '#8B949E',
+      label: t?.trackState || 'SEARCH',
+      dashed: true,
+    })
+  } else if (t && t.trackState !== 'SEARCH' && t.trackState !== 'LOST') {
     const sizePx = Math.max(72, Math.min(220, 280000 / Math.max(t.range || 1, 1)))
     const cx = ((t.posX ?? 50) / 100) * AI_CAM_W
     const cy = ((t.posY ?? 50) / 100) * AI_CAM_H
@@ -87,7 +97,7 @@ export function useRecHud() {
       }).catch(() => undefined)
     }
     tick()
-    const id = setInterval(tick, 400)
+    const id = setInterval(tick, 250)
     return () => {
       dead = true
       clearInterval(id)

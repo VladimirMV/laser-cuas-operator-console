@@ -373,6 +373,9 @@ function writeRecFrame(ch, jpeg) {
     s.stream.write(jpeg)
     s.bytes += jpeg.length
     s.n++
+    if (s.burn && s.burn.stdin && s.burn.stdin.writable) {
+      try { s.burn.stdin.write(jpeg) } catch { /* */ }
+    }
     s.index.write(JSON.stringify({ t, off, len: jpeg.length }) + '\n')
     if (s.n === 1 || s.n % 40 === 0) {
       console.log(`[sidecar] REC ${ch} jpeg #${s.n} ${s.bytes}B t=${t}ms`)
@@ -781,22 +784,28 @@ function remuxCopy(from, to) {
   return false
 }
 
-function remuxCopyMjpeg(from, to, fps) {
+function remuxCopyMjpeg(from, to, fps, sessionId, ch) {
   ensureDir(path.dirname(to))
   const rate = String(Math.min(15, Math.max(2, fps || 8)))
-  try {
-    execFileSync(ffmpegBin, [
-      '-y', '-hide_banner', '-loglevel', 'error',
-      '-f', 'mjpeg', '-framerate', rate, '-i', from,
-      '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
-      '-an', '-movflags', '+faststart', to,
-    ], { timeout: 120000, stdio: ['ignore', 'ignore', 'pipe'] })
-    return fs.existsSync(to) && fs.statSync(to).size > 4096
-  } catch (e) {
-    console.warn(`[sidecar] remux mjpeg fail ${e.message}`)
-    try { if (fs.existsSync(to)) fs.unlinkSync(to) } catch { /* */ }
-    return false
+  const common = ['-y', '-hide_banner', '-loglevel', 'error', '-f', 'mjpeg', '-framerate', rate, '-i', from]
+  const enc = ['-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-an', '-movflags', '+faststart', to]
+  const tryRun = (args) => {
+    try {
+      execFileSync(ffmpegBin, args, { timeout: 180000, stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true })
+      return fs.existsSync(to) && fs.statSync(to).size > 4096
+    } catch {
+      try { if (fs.existsSync(to)) fs.unlinkSync(to) } catch { /* */ }
+      return false
+    }
   }
+  const alreadyHud = /hud\.mjpg$/i.test(from)
+  if (!alreadyHud && sessionId && ch) {
+    const { movie } = recBurnFilters(sessionId, ch)
+    if (tryRun([...common, '-filter_complex', movie, '-map', '[vout]', ...enc])) return true
+  }
+  if (tryRun([...common, ...enc])) return true
+  console.warn(`[sidecar] remux mjpeg fail ${from}`)
+  return false
 }
 
 const harvested = new Set()
@@ -1058,7 +1067,14 @@ function renderHudPng(sessionId, ch, boxes) {
   hudLast[key] = now
   const g = geometry(ch)
   const png = hudPngPath(sessionId, ch)
+  const fsSz = ch === 'IR' ? 16 : 28
+  const clock = new Date().toISOString().replace('T', ' ').slice(0, 19)
+  const line = (recording && recording.hud && recording.hud.line)
+    ? String(recording.hud.line).replace(/['\\:]/g, ' ').slice(0, 80)
+    : ch
   const vf = ['format=rgba']
+  vf.push(`drawtext${fontOpt()}:text='${clock}':x=24:y=${g.h - 16 - fsSz}:fontsize=${fsSz}:fontcolor=white:box=1:boxcolor=black@0.7:boxborderw=8`)
+  vf.push(`drawtext${fontOpt()}:text='${line}':x=24:y=18:fontsize=${Math.max(14, fsSz - 6)}:fontcolor=0x7EE787:box=1:boxcolor=black@0.65:boxborderw=8`)
   vf.push(`drawbox=x=${Math.round(g.w / 2 - 1)}:y=${Math.round(g.h / 2 - 52)}:w=2:h=104:color=white@0.9:t=fill`)
   vf.push(`drawbox=x=${Math.round(g.w / 2 - 52)}:y=${Math.round(g.h / 2 - 1)}:w=104:h=2:color=white@0.9:t=fill`)
   vf.push(`drawbox=x=${Math.round(g.w / 2 - 64)}:y=${Math.round(g.h / 2 - 64)}:w=128:h=128:color=0x3FB950@0.95:t=3`)
@@ -1088,13 +1104,12 @@ function renderHudPng(sessionId, ch, boxes) {
   proc.on('error', () => { hudBusy[key] = false })
 }
 function recBurnFilters(sessionId, ch) {
-  const txt = ffPath(hudTxtPath(sessionId, ch)).replace(/:/g, '\\\\:')
-  const pngRel = ffPath(path.relative(process.cwd(), hudPngPath(sessionId, ch)) || hudPngPath(sessionId, ch))
-  const time = `drawtext${fontOpt()}:text='%{localtime}':x=24:y=18:fontsize=30:fontcolor=white:box=1:boxcolor=black@0.7:boxborderw=10`
-  const info = `drawtext${fontOpt()}:textfile='${txt}':reload=1:x=24:y=58:fontsize=22:fontcolor=0x7EE787:box=1:boxcolor=black@0.65:boxborderw=8`
-  const vf = `${time},${info}`
-  const movie = `movie='${pngRel}':reload=1,format=rgba[hud];[0:v]${vf}[base];[base][hud]overlay=0:0:eof_action=repeat:repeatlast=1[vout]`
-  return { vf, movie }
+  const png = ffPath(hudPngPath(sessionId, ch)).replace(/:/g, '\\:')
+  const fsSz = ch === 'IR' ? 16 : 28
+  const yTime = ch === 'IR' ? 470 : 1028
+  const time = `drawtext${fontOpt()}:text='%{localtime\\:%Y-%m-%d %H\\:%M\\:%S}':x=24:y=${yTime}:fontsize=${fsSz}:fontcolor=white:box=1:boxcolor=black@0.7:boxborderw=8`
+  const movie = `movie='${png}':reload=1,format=rgba[hud];[hud][0:v]scale2ref[hs][base];[base]${time}[t];[t][hs]overlay=0:0:eof_action=repeat:repeatlast=1[vout]`
+  return { vf: time, movie }
 }
 
 function recInputArgs(ch) {
@@ -1244,12 +1259,39 @@ async function handleStart(body) {
     try { if (fs.existsSync(mjpg)) fs.unlinkSync(mjpg) } catch { /* */ }
     try { if (fs.existsSync(idx)) fs.unlinkSync(idx) } catch { /* */ }
     writeHudTxt(sessionId, ch, `${ch}  REC`)
+    renderHudPng(sessionId, ch, [])
     sinks[ch] = {
       stream: fs.createWriteStream(mjpg),
       index: fs.createWriteStream(idx),
       bytes: 0,
       n: 0,
       file: mjpg,
+      burn: null,
+      burnFile: path.join(destDir, 'rec.hud.mjpg'),
+    }
+    if (ffmpegInfo.ok) {
+      try {
+        const hp = hudPngPath(sessionId, ch)
+        if (!fs.existsSync(hp)) {
+          execFileSync(ffmpegBin, [
+            '-y', '-hide_banner', '-loglevel', 'error',
+            '-f', 'lavfi', '-i', `color=c=0x00000000:s=${geometry(ch).size}:d=0.04`,
+            '-frames:v', '1', ffPath(hp),
+          ], { timeout: 8000, windowsHide: true })
+        }
+      } catch { /* */ }
+      const { movie } = recBurnFilters(sessionId, ch)
+      sinks[ch].burn = spawnLogged(ffmpegBin, [
+        '-y', '-hide_banner', '-loglevel', 'warning',
+        '-f', 'mjpeg', '-framerate', '8', '-i', 'pipe:0',
+        '-filter_complex', movie,
+        '-map', '[vout]',
+        '-c:v', 'mjpeg', '-q:v', '5',
+        '-f', 'mjpeg',
+        ffPath(sinks[ch].burnFile),
+      ], `burn:${ch}`)
+      ffmpegProcs.push(sinks[ch].burn)
+      console.log(`[sidecar] REC ${ch} HUD burn on`)
     }
     const hub = liveHubs[ch]
     console.log(`[sidecar] REC ${ch} jpeg-dump → ${mjpg} hub=${hub && hub.n || 0} frames`)
@@ -1331,9 +1373,15 @@ async function handleStop() {
 
   const files = []
   for (const ch of snap.channels) {
-    const mjpg = recMjpgPath(snap.sessionId, ch)
+    const sink = snap.sinks && snap.sinks[ch]
+    if (sink && sink.burn) {
+      try { sink.burn.stdin.end() } catch { /* */ }
+    }
+    const mjpgRaw = recMjpgPath(snap.sessionId, ch)
+    const mjpgHud = sink && sink.burnFile
+    const mjpg = (mjpgHud && fs.existsSync(mjpgHud) && fs.statSync(mjpgHud).size > 800) ? mjpgHud : mjpgRaw
     const mp4File = recMp4Path(snap.sessionId, ch)
-    const n = snap.sinks && snap.sinks[ch] ? snap.sinks[ch].n : 0
+    const n = sink ? sink.n : 0
     const bytes = fs.existsSync(mjpg) ? fs.statSync(mjpg).size : 0
     if (bytes < 800) {
       console.warn(`[sidecar] REC stop ${ch} no jpeg dump (${bytes}B, frames=${n})`)
@@ -1342,7 +1390,7 @@ async function handleStop() {
     let used = mjpg
     if (refreshFfmpeg()) {
       const fps = Math.max(1, Math.round((n || 1) / Math.max(1, elapsed / 1000)))
-      const ok = remuxCopyMjpeg(mjpg, mp4File, fps)
+      const ok = remuxCopyMjpeg(mjpg, mp4File, fps, snap.sessionId, ch)
       if (ok) used = mp4File
       else console.warn(`[sidecar] REC remux skip ${ch}, keep rec.mjpg ${bytes}B`)
     }
