@@ -363,9 +363,29 @@ function writeFrame(client, jpeg) {
   return res.write('\r\n')
 }
 
+function writeRecFrame(ch, jpeg) {
+  const rec = recording
+  if (!rec || !rec.sinks || !rec.sinks[ch] || !jpeg) return
+  const s = rec.sinks[ch]
+  try {
+    const t = Date.now() - rec.startedAt
+    const off = s.bytes
+    s.stream.write(jpeg)
+    s.bytes += jpeg.length
+    s.n++
+    s.index.write(JSON.stringify({ t, off, len: jpeg.length }) + '\n')
+    if (s.n === 1 || s.n % 40 === 0) {
+      console.log(`[sidecar] REC ${ch} jpeg #${s.n} ${s.bytes}B t=${t}ms`)
+    }
+  } catch (e) {
+    console.warn(`[sidecar] REC write ${ch} ${e.message}`)
+  }
+}
+
 function broadcastJpeg(hub, jpeg) {
   hub.lastJpeg = jpeg
   previewCache[hub.ch] = jpeg
+  writeRecFrame(hub.ch, jpeg)
   for (const client of [...hub.clients]) {
     try {
       if (!writeFrame(client, jpeg)) hub.clients.delete(client)
@@ -746,6 +766,24 @@ function remuxCopy(from, to) {
   return false
 }
 
+function remuxCopyMjpeg(from, to, fps) {
+  ensureDir(path.dirname(to))
+  const rate = String(Math.min(15, Math.max(2, fps || 8)))
+  try {
+    execFileSync(ffmpegBin, [
+      '-y', '-hide_banner', '-loglevel', 'error',
+      '-f', 'mjpeg', '-framerate', rate, '-i', from,
+      '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
+      '-an', '-movflags', '+faststart', to,
+    ], { timeout: 120000, stdio: ['ignore', 'ignore', 'pipe'] })
+    return fs.existsSync(to) && fs.statSync(to).size > 4096
+  } catch (e) {
+    console.warn(`[sidecar] remux mjpeg fail ${e.message}`)
+    try { if (fs.existsSync(to)) fs.unlinkSync(to) } catch { /* */ }
+    return false
+  }
+}
+
 const harvested = new Set()
 
 function harvestRing(sessionId, channels) {
@@ -960,6 +998,12 @@ function recTsPath(sessionId, ch) {
 function recMp4Path(sessionId, ch) {
   return path.join(channelDir(sessionId, ch), 'rec.mp4')
 }
+function recMjpgPath(sessionId, ch) {
+  return path.join(channelDir(sessionId, ch), 'rec.mjpg')
+}
+function recIndexPath(sessionId, ch) {
+  return path.join(channelDir(sessionId, ch), 'rec.index.jsonl')
+}
 function findFont() {
   const list = [
     'C:/Windows/Fonts/consola.ttf',
@@ -1085,17 +1129,54 @@ function sessionRecRefs(id) {
   const refs = []
   for (const ch of ['LONG', 'IR', 'WIDE']) {
     const mp4 = recMp4Path(id, ch)
-    if (!fs.existsSync(mp4) || fs.statSync(mp4).size < 4096) continue
-    refs.push(makeRecRef(id, ch, mp4, fs.statSync(mp4).mtimeMs, probeDurationMs(mp4)))
+    if (fs.existsSync(mp4) && fs.statSync(mp4).size > 4096) {
+      refs.push(makeRecRef(id, ch, mp4, fs.statSync(mp4).mtimeMs, probeDurationMs(mp4)))
+      continue
+    }
+    const mjpg = recMjpgPath(id, ch)
+    if (fs.existsSync(mjpg) && fs.statSync(mjpg).size > 800) {
+      const ref = makeRecRef(id, ch, mjpg, fs.statSync(mjpg).mtimeMs, 0)
+      ref.container = 'mjpeg'
+      ref.codec = 'mjpeg'
+      ref.url = `/replay/${id}/${ch}`
+      ref.label = `${ch} jpeg rec`
+      refs.push(ref)
+    }
   }
   return refs
 }
 
 function recProcsAlive() {
-  if (recording && recording.recViaRing) {
-    return recording.channels.some((ch) => ringProcs[ch] && ringProcs[ch].exitCode == null && !ringProcs[ch].killed)
+  return Boolean(recording && recording.sinks)
+}
+
+function frameAt(sessionId, ch, tMs) {
+  const mjpg = recMjpgPath(sessionId, ch)
+  const idxFile = recIndexPath(sessionId, ch)
+  if (!fs.existsSync(mjpg)) return null
+  let best = null
+  if (fs.existsSync(idxFile)) {
+    const lines = fs.readFileSync(idxFile, 'utf8').split(/\r?\n/)
+    for (const line of lines) {
+      if (!line) continue
+      let j
+      try { j = JSON.parse(line) } catch { continue }
+      if (!best || j.t <= tMs) best = j
+      else break
+    }
   }
-  return ffmpegProcs.some((p) => p && p.exitCode == null && !p.killed)
+  if (best && best.len > 0) {
+    const fd = fs.openSync(mjpg, 'r')
+    try {
+      const buf = Buffer.alloc(best.len)
+      fs.readSync(fd, buf, 0, best.len, best.off)
+      return buf
+    } finally {
+      fs.closeSync(fd)
+    }
+  }
+  const buf = fs.readFileSync(mjpg)
+  return extractJpeg(buf)
 }
 
 async function handleStart(body) {
@@ -1118,16 +1199,10 @@ async function handleStart(body) {
       refs: recording.refs || [],
     }
   }
-  if (!refreshFfmpeg()) return { ok: false, message: 'FFmpeg not available on side-car host. winget install Gyan.FFmpeg' }
-
   const sessionId = String(body.sessionId || `SES-${Date.now()}`)
   let channels = Array.isArray(body.channels) ? body.channels.map(String) : ['LONG', 'IR']
   channels = channels.filter((c) => c !== 'WIDE' && CHANNELS.includes(c))
   if (!channels.length) channels = ['LONG', 'IR']
-
-  const wantCodec = 'h264'
-  const encoder = pickEncoder('h264') || pickEncoder('h265')
-  if (!encoder) return { ok: false, message: 'No suitable video encoder' }
 
   const bitrates = {
     LONG: config.bitratesKbps?.LONG ?? 4000,
@@ -1143,72 +1218,70 @@ async function handleStart(body) {
   ffmpegProcs = []
   const refs = []
   const t0 = Date.now()
-  const recTs = {}
+  const sinks = {}
 
   for (const ch of channels) {
     ensureLiveHub(ch)
     const destDir = channelDir(sessionId, ch)
     ensureDir(destDir)
-    const tsFile = recTsPath(sessionId, ch)
-    const mp4File = recMp4Path(sessionId, ch)
-    try { if (fs.existsSync(tsFile)) fs.unlinkSync(tsFile) } catch { /* */ }
-    try { if (fs.existsSync(mp4File)) fs.unlinkSync(mp4File) } catch { /* */ }
+    const mjpg = recMjpgPath(sessionId, ch)
+    const idx = recIndexPath(sessionId, ch)
+    try { if (fs.existsSync(mjpg)) fs.unlinkSync(mjpg) } catch { /* */ }
+    try { if (fs.existsSync(idx)) fs.unlinkSync(idx) } catch { /* */ }
     writeHudTxt(sessionId, ch, `${ch}  REC`)
-    const src = recInputArgs(ch)
-    const gop = geometry(ch).fps
-    const br = bitrates[ch] || 3000
-    const recVf = `drawtext${fontOpt()}:text='%{localtime}':x=24:y=18:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.65:boxborderw=8,drawbox=x=(iw-2)/2:y=ih/2-48:w=2:h=96:color=white@0.85:t=fill,drawbox=x=iw/2-48:y=(ih-2)/2:w=96:h=2:color=white@0.85:t=fill`
-    const args = [
-      '-y', '-hide_banner', '-loglevel', 'warning',
-      ...src.args,
-      '-an',
-      '-vf', recVf,
-      ...videoEncodeArgs(encoder, br, gop),
-      '-f', 'mpegts',
-      ffPath(tsFile),
-    ]
-    console.log(`[sidecar] REC ${ch} ← hub ← ${src.fromUrl}`)
-    ffmpegProcs.push(spawnLogged(ffmpegBin, args, `rec:${ch}`))
-    recTs[ch] = tsFile
-    const ref = makeRecRef(sessionId, ch, mp4File, t0, 0)
+    sinks[ch] = {
+      stream: fs.createWriteStream(mjpg),
+      index: fs.createWriteStream(idx),
+      bytes: 0,
+      n: 0,
+      file: mjpg,
+    }
+    const hub = liveHubs[ch]
+    console.log(`[sidecar] REC ${ch} jpeg-dump → ${mjpg} hub=${hub && hub.n || 0} frames`)
+    const ref = makeRecRef(sessionId, ch, mjpg, t0, 0)
     ref.label = `${ch} recording`
-    delete ref.url
+    ref.container = 'mjpeg'
+    ref.url = `/replay/${sessionId}/${ch}`
     refs.push(ref)
   }
 
-  if (!ffmpegProcs.length) return { ok: false, message: 'No camera for REC' }
+  if (!Object.keys(sinks).length) return { ok: false, message: 'No camera for REC' }
 
   recording = {
     sessionId,
-    channels: Object.keys(recTs),
-    codec: wantCodec,
-    actualCodec: 'h264',
-    encoder: encoder.enc,
+    channels: Object.keys(sinks),
+    codec: 'mjpeg',
+    actualCodec: 'mjpeg',
+    encoder: 'node-jpeg',
     startedAt: t0,
     bitrates,
     refs,
-    recTs,
+    sinks,
+    recTs: {},
     copyMode: false,
     recViaRing: false,
   }
   if (globalThis.__recWatch) clearInterval(globalThis.__recWatch)
   globalThis.__recWatch = setInterval(() => {
-    if (!recording) return
+    if (!recording || !recording.sinks) return
     for (const ch of recording.channels) {
-      const f = recTsPath(recording.sessionId, ch)
-      let sz = 0
-      try { sz = fs.existsSync(f) ? fs.statSync(f).size : 0 } catch { sz = 0 }
-      console.log(`[sidecar] REC ${ch} rec.ts ${sz}B`)
+      const s = recording.sinks[ch]
+      const hub = liveHubs[ch]
+      console.log(`[sidecar] REC ${ch} jpeg #${s ? s.n : 0} ${s ? s.bytes : 0}B hub=${hub && hub.n || 0}`)
     }
-  }, 5000)
-  console.log(`[sidecar] REC START ${sessionId} channels=${recording.channels.join('+')} one-file mpegts ← camera`)
+  }, 4000)
+  for (const ch of recording.channels) {
+    const hub = liveHubs[ch]
+    if (hub && hub.lastJpeg) writeRecFrame(ch, hub.lastJpeg)
+  }
+  console.log(`[sidecar] REC START ${sessionId} JPEG dump (no ffmpeg capture) ${recording.channels.join('+')}`)
   return {
     ok: true,
     sessionId,
     channels: recording.channels,
-    codec_target: wantCodec,
-    codec_actual: 'h264',
-    encoder: encoder.enc,
+    codec_target: 'mjpeg',
+    codec_actual: 'mjpeg',
+    encoder: 'node-jpeg',
     mediaRoot: MEDIA_ROOT,
     refs,
   }
@@ -1233,25 +1306,41 @@ async function handleStop() {
   }
   ffmpegProcs = []
 
+  if (snap.sinks) {
+    for (const ch of Object.keys(snap.sinks)) {
+      try { snap.sinks[ch].stream.end() } catch { /* */ }
+      try { snap.sinks[ch].index.end() } catch { /* */ }
+    }
+    await new Promise((r) => setTimeout(r, 400))
+  }
+
   const files = []
   for (const ch of snap.channels) {
-    const tsFile = (snap.recTs && snap.recTs[ch]) || recTsPath(snap.sessionId, ch)
+    const mjpg = recMjpgPath(snap.sessionId, ch)
     const mp4File = recMp4Path(snap.sessionId, ch)
-    if (!fs.existsSync(tsFile) || fs.statSync(tsFile).size < 4096) {
-      console.warn(`[sidecar] REC stop ${ch} no ts (${tsFile})`)
+    const n = snap.sinks && snap.sinks[ch] ? snap.sinks[ch].n : 0
+    const bytes = fs.existsSync(mjpg) ? fs.statSync(mjpg).size : 0
+    if (bytes < 800) {
+      console.warn(`[sidecar] REC stop ${ch} no jpeg dump (${bytes}B, frames=${n})`)
       continue
     }
-    const ok = remuxCopy(tsFile, mp4File)
-    if (!ok) {
-      console.warn(`[sidecar] REC remux fail ${ch}, keeping ts`)
-      continue
+    let used = mjpg
+    if (refreshFfmpeg()) {
+      const fps = Math.max(1, Math.round((n || 1) / Math.max(1, elapsed / 1000)))
+      const ok = remuxCopyMjpeg(mjpg, mp4File, fps)
+      if (ok) used = mp4File
+      else console.warn(`[sidecar] REC remux skip ${ch}, keep rec.mjpg ${bytes}B`)
     }
-    try { fs.unlinkSync(tsFile) } catch { /* */ }
-    const dur = probeDurationMs(mp4File) || elapsed
-    const ref = makeRecRef(snap.sessionId, ch, mp4File, snap.startedAt, dur)
+    const dur = used.endsWith('.mp4') ? (probeDurationMs(used) || elapsed) : elapsed
+    const ref = makeRecRef(snap.sessionId, ch, used, snap.startedAt, dur)
+    if (!used.endsWith('.mp4')) {
+      ref.container = 'mjpeg'
+      ref.codec = 'mjpeg'
+      ref.url = `/replay/${snap.sessionId}/${ch}`
+    }
     files.push(ref)
     appendIndex(snap.sessionId, ref)
-    console.log(`[sidecar] REC STOP ${ch} ${path.basename(mp4File)} ${fs.statSync(mp4File).size}B ${dur}ms`)
+    console.log(`[sidecar] REC STOP ${ch} ${path.basename(used)} ${fs.statSync(used).size}B frames=${n} ${dur}ms`)
   }
   recording = null
   return {
@@ -1272,14 +1361,9 @@ async function handleSnapshot(body) {
   const mono = recording ? Date.now() - recording.startedAt : 0
   const name = `${mono}_${body.triggerEventId || 'SNAP'}_${ch}.jpg`
   const outFile = path.join(snapDir, name)
-  const { args: inArgs } = inputArgs(ch)
-  if (!inArgs) return { ok: false, message: `channel ${ch} not fitted` }
-  const args = ['-y', '-hide_banner', '-loglevel', 'error', ...inArgs, '-frames:v', '1', '-q:v', '2', outFile]
-  try {
-    execFileSync(ffmpegBin, args, { timeout: 20000 })
-  } catch (e) {
-    return { ok: false, message: `snapshot failed: ${e.message}` }
-  }
+  const jpeg = readPreviewJpeg(ch)
+  if (!jpeg) return { ok: false, message: `no live frame for ${ch}` }
+  fs.writeFileSync(outFile, jpeg)
   const rel = path.relative(MEDIA_ROOT, outFile).replace(/\\/g, '/')
   const ref = {
     id: `MED-snap-${Date.now()}`,
@@ -1646,6 +1730,24 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(503, { ...CORS, 'Retry-After': '1' })
       return res.end('no frame yet — camera hub warming up')
     }
+    if (method === 'GET' && url.pathname.startsWith('/replay/')) {
+      const parts = url.pathname.split('/').filter(Boolean)
+      const sessionId = parts[1]
+      const ch = String(parts[2] || 'LONG').toUpperCase()
+      const tMs = Number(url.searchParams.get('t') || 0)
+      const jpeg = frameAt(sessionId, ch, tMs)
+      if (!jpeg) {
+        res.writeHead(404, CORS)
+        return res.end('no rec frames')
+      }
+      res.writeHead(200, {
+        ...CORS,
+        'Content-Type': 'image/jpeg',
+        'Cache-Control': 'no-store',
+        'Content-Length': jpeg.length,
+      })
+      return res.end(jpeg)
+    }
     if (method === 'GET' && url.pathname === '/caps') return json(res, 200, getCaps())
     if (method === 'GET' && url.pathname === '/status') {
       return json(res, 200, {
@@ -1662,6 +1764,13 @@ const server = http.createServer(async (req, res) => {
               startedAt: new Date(recording.startedAt).toISOString(),
               elapsedMs: Date.now() - recording.startedAt,
             }
+          : null,
+        hubs: Object.fromEntries(CHANNELS.map((ch) => {
+          const h = liveHubs[ch]
+          return [ch, h ? { cam: h.cam, ready: h.ready, n: h.n || 0, last: h.lastJpeg ? h.lastJpeg.length : 0 } : null]
+        })),
+        rec: recording && recording.sinks
+          ? Object.fromEntries(recording.channels.map((ch) => [ch, { n: recording.sinks[ch].n, bytes: recording.sinks[ch].bytes }]))
           : null,
         streams: Object.fromEntries(CHANNELS.map((ch) => [ch, liveUrl(ch) || null])),
         ring: Object.fromEntries(

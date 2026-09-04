@@ -23,7 +23,7 @@ function segmentFor(bundle: SessionBundle, channel: CameraChannel, t: number): M
     .filter((m) => m.channel === channel && (m.kind === 'SEGMENT' || m.kind === 'CLIP') && m.url)
     .sort((a, b) => a.t_mono_ms - b.t_mono_ms)
   if (!segs.length) return null
-  const rec = segs.find((s) => /rec\.mp4(\?|$)/i.test(s.url || '') || /session/i.test(s.label || ''))
+  const rec = segs.find((s) => /rec\.mp4(\?|$)|\/replay\//i.test(s.url || '') || /session|jpeg rec|recording/i.test(s.label || ''))
   if (rec) return rec
   let cur = segs[0]
   for (const s of segs) {
@@ -31,6 +31,36 @@ function segmentFor(bundle: SessionBundle, channel: CameraChannel, t: number): M
     else break
   }
   return cur
+}
+
+function JpegReplay({ url, playhead, className }: { url: string; playhead: number; className?: string }) {
+  const [src, setSrc] = useState<string | null>(null)
+  useEffect(() => {
+    let stop = false
+    let obj: string | null = null
+    const tick = async () => {
+      if (stop) return
+      try {
+        const r = await fetch(`${url}?t=${Math.round(playhead)}`, { cache: 'no-store' })
+        if (r.ok) {
+          const blob = await r.blob()
+          if (blob.size >= 256) {
+            const next = URL.createObjectURL(blob)
+            if (obj) URL.revokeObjectURL(obj)
+            obj = next
+            setSrc(next)
+          }
+        }
+      } catch { /* */ }
+    }
+    void tick()
+    return () => {
+      stop = true
+      if (obj) URL.revokeObjectURL(obj)
+    }
+  }, [url, playhead])
+  if (!src) return null
+  return <img src={src} alt="" className={className} />
 }
 
 function ReplayFeed({
@@ -47,6 +77,7 @@ function ReplayFeed({
   const [broken, setBroken] = useState(false)
   const seg = hud ? segmentFor(bundle, channel, playhead) : null
   const url = seg?.url
+  const jpegReplay = Boolean(url && (/\/replay\//.test(url) || /\.mjpg(\?|$)/i.test(url)))
   useEffect(() => {
     setReady(false)
     setBroken(false)
@@ -70,7 +101,10 @@ function ReplayFeed({
   }, [url])
   return (
     <div className={className}>
-      {url && (
+      {url && jpegReplay && (
+        <JpegReplay url={url.startsWith('http') ? url : `http://127.0.0.1:8787${url}`} playhead={playhead} className="absolute inset-0 h-full w-full object-cover bg-black" />
+      )}
+      {url && !jpegReplay && (
         <video
           ref={vid}
           src={url}
@@ -82,8 +116,8 @@ function ReplayFeed({
           className="absolute inset-0 h-full w-full object-cover bg-black"
         />
       )}
-      <ReplayCanvas channel={channel} hud={hud!} t={playhead} hasVideo={ready && !broken} className="absolute inset-0 h-full w-full pointer-events-none" />
-      {(!url || broken) && (
+      <ReplayCanvas channel={channel} hud={hud!} t={playhead} hasVideo={jpegReplay ? Boolean(url) : (ready && !broken)} className="absolute inset-0 h-full w-full pointer-events-none" />
+      {(!url || (broken && !jpegReplay)) && (
         <div className="absolute bottom-3 left-3 z-10 font-mono text-[10px] tracking-widest text-[#F85149] bg-black/70 px-2 py-1">
           {broken ? 'VIDEO NOT PLAYABLE' : 'NO VIDEO — REC then Stop, wait remux, Оновити'}
         </div>
