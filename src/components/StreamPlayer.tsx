@@ -8,7 +8,6 @@ import { cn } from '../lib/utils'
 
 type Props = {
   url: string | null
-  fallbackUrl?: string | null
   className?: string
   notFittedLabel?: string
   thermalStyle?: boolean
@@ -58,11 +57,9 @@ function JpegPoll({
           } else fails++
         } else {
           fails++
-          if (fails >= 6 && fallbackUrl) setDirect(true)
         }
       } catch {
         fails++
-        if (fails >= 6 && fallbackUrl) setDirect(true)
       }
       if (!stop) window.setTimeout(tick, direct ? 2000 : 150)
     }
@@ -75,7 +72,7 @@ function JpegPoll({
 
   return (
     <div className={cn('absolute inset-0 bg-black', className)}>
-      {direct && fallbackUrl ? (
+      {false && fallbackUrl ? (
         <img
           src={fallbackUrl}
           alt=""

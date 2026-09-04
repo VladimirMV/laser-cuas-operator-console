@@ -289,10 +289,11 @@ function harvestPreview(ch) {
   } catch { /* locked by ffmpeg */ }
 }
 function readPreviewJpeg(ch) {
-  harvestPreview(ch)
-  if (previewCache[ch] && previewCache[ch].length > 800) return previewCache[ch]
   const hub = liveHubs[ch]
   if (hub && hub.lastJpeg && hub.lastJpeg.length > 800) return hub.lastJpeg
+  if (previewCache[ch] && previewCache[ch].length > 800) return previewCache[ch]
+  harvestPreview(ch)
+  if (previewCache[ch] && previewCache[ch].length > 800) return previewCache[ch]
   return null
 }
 
@@ -364,6 +365,7 @@ function writeFrame(client, jpeg) {
 
 function broadcastJpeg(hub, jpeg) {
   hub.lastJpeg = jpeg
+  previewCache[hub.ch] = jpeg
   for (const client of [...hub.clients]) {
     try {
       if (!writeFrame(client, jpeg)) hub.clients.delete(client)
@@ -395,19 +397,41 @@ function ensureLiveHub(ch) {
   }
   liveHubs[ch] = hub
 
-  const connect = () => {
+  const connect = (url, depth) => {
     if (liveHubs[ch] !== hub || hub.dead) return
+    const target = url || cam
+    depth = depth || 0
     try {
-      const req = http.get(cam, {
-        headers: { Accept: '*/*', Connection: 'keep-alive', 'User-Agent': 'Laser-CUAS-sidecar/1.8.1' },
+      const u = new URL(target)
+      const req = http.get({
+        hostname: u.hostname,
+        port: u.port || 80,
+        path: u.pathname + u.search,
+        headers: {
+          Accept: 'multipart/x-mixed-replace,image/jpeg,*/*',
+          Connection: 'keep-alive',
+          'User-Agent': 'Mozilla/5.0 Laser-CUAS-sidecar/1.8.1',
+        },
       }, (inc) => {
         if (liveHubs[ch] !== hub) { inc.destroy(); return }
+        const code = inc.statusCode || 0
+        const loc = inc.headers.location
+        if (code >= 300 && code < 400 && loc && depth < 4) {
+          inc.resume()
+          const next = new URL(loc, target).href
+          console.log(`[sidecar] live hub ${ch} redirect ${code} → ${next}`)
+          connect(next, depth + 1)
+          return
+        }
         req.setTimeout(0)
         inc.setTimeout(0)
         hub.upstream = inc
         hub.buf = Buffer.alloc(0)
-        console.log(`[sidecar] live hub ${ch} connected ← ${cam}`)
+        console.log(`[sidecar] live hub ${ch} HTTP ${code} ct=${inc.headers['content-type'] || '?'} ← ${target}`)
         inc.on('data', (chunk) => {
+          if (!hub.n) {
+            console.log(`[sidecar] live hub ${ch} first bytes ${chunk.slice(0, 12).toString('hex')} ${chunk.length}B`)
+          }
           const frames = pullJpegs(hub, chunk)
           for (const jpeg of frames) {
             if (!hub.ready) {
@@ -581,8 +605,8 @@ async function refreshAndRing({ scan = false } = {}) {
     console.warn('[sidecar] camera IP not found yet — ring idle. Keep HMI open (ARP) or set IP in config.json')
     return false
   }
-  for (const ch of ready) startGrab(ch, recording && recording.recTs ? recording.recTs[ch] : null)
-  ringHot = ready.some((ch) => ringProcs[ch] && ringProcs[ch].exitCode == null)
+  for (const ch of ready) ensureLiveHub(ch)
+  ringHot = ready.some((ch) => liveHubs[ch] && !liveHubs[ch].dead)
   return ringHot
 }
 
@@ -1015,8 +1039,17 @@ function recBurnFilters(sessionId, ch) {
 }
 
 function recInputArgs(ch) {
-  // Same hub as the ring — one TCP to the camera, ffmpeg reads local MJPEG fan-out.
-  return inputArgs(ch)
+  ensureLiveHub(ch)
+  return {
+    args: [
+      '-f', 'mjpeg',
+      '-fflags', '+genpts+discardcorrupt',
+      '-use_wallclock_as_timestamps', '1',
+      '-i', `http://127.0.0.1:${PORT}/live/${ch}.mjpeg?raw=1`,
+    ],
+    fromUrl: liveUrl(ch),
+    kind: 'mjpeg',
+  }
 }
 function probeDurationMs(file) {
   try {
@@ -1113,11 +1146,7 @@ async function handleStart(body) {
   const recTs = {}
 
   for (const ch of channels) {
-    const src = inputArgs(ch)
-    if (!src.args) {
-      console.log(`[sidecar] REC ${ch} skipped (no camera)`)
-      continue
-    }
+    ensureLiveHub(ch)
     const destDir = channelDir(sessionId, ch)
     ensureDir(destDir)
     const tsFile = recTsPath(sessionId, ch)
@@ -1125,6 +1154,21 @@ async function handleStart(body) {
     try { if (fs.existsSync(tsFile)) fs.unlinkSync(tsFile) } catch { /* */ }
     try { if (fs.existsSync(mp4File)) fs.unlinkSync(mp4File) } catch { /* */ }
     writeHudTxt(sessionId, ch, `${ch}  REC`)
+    const src = recInputArgs(ch)
+    const gop = geometry(ch).fps
+    const br = bitrates[ch] || 3000
+    const recVf = `drawtext${fontOpt()}:text='%{localtime}':x=24:y=18:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.65:boxborderw=8,drawbox=x=(iw-2)/2:y=ih/2-48:w=2:h=96:color=white@0.85:t=fill,drawbox=x=iw/2-48:y=(ih-2)/2:w=96:h=2:color=white@0.85:t=fill`
+    const args = [
+      '-y', '-hide_banner', '-loglevel', 'warning',
+      ...src.args,
+      '-an',
+      '-vf', recVf,
+      ...videoEncodeArgs(encoder, br, gop),
+      '-f', 'mpegts',
+      ffPath(tsFile),
+    ]
+    console.log(`[sidecar] REC ${ch} ← hub ← ${src.fromUrl}`)
+    ffmpegProcs.push(spawnLogged(ffmpegBin, args, `rec:${ch}`))
     recTs[ch] = tsFile
     const ref = makeRecRef(sessionId, ch, mp4File, t0, 0)
     ref.label = `${ch} recording`
@@ -1132,16 +1176,11 @@ async function handleStart(body) {
     refs.push(ref)
   }
 
-  if (!Object.keys(recTs).length) return { ok: false, message: 'No camera for REC' }
-
-  recTs._br = bitrates
-  stopRing()
-  startRing(recTs)
-  if (!ringHot) return { ok: false, message: 'Ring/REC ffmpeg failed to start' }
+  if (!ffmpegProcs.length) return { ok: false, message: 'No camera for REC' }
 
   recording = {
     sessionId,
-    channels: Object.keys(recTs).filter((k) => k !== '_br'),
+    channels: Object.keys(recTs),
     codec: wantCodec,
     actualCodec: 'h264',
     encoder: encoder.enc,
@@ -1150,7 +1189,7 @@ async function handleStart(body) {
     refs,
     recTs,
     copyMode: false,
-    recViaRing: true,
+    recViaRing: false,
   }
   if (globalThis.__recWatch) clearInterval(globalThis.__recWatch)
   globalThis.__recWatch = setInterval(() => {
@@ -1181,14 +1220,17 @@ async function handleStop() {
   if (globalThis.__recWatch) { clearInterval(globalThis.__recWatch); globalThis.__recWatch = null }
   const snap = recording
   const elapsed = Date.now() - snap.startedAt
-  // rec is muxed on the same ffmpeg as the ring — stop it to flush rec.ts, then bring live back
-  for (const ch of snap.channels) {
-    const p = ringProcs[ch]
-    try { p?.stdin?.write('q'); p?.stdin?.end() } catch { /* */ }
+  for (const p of ffmpegProcs) {
+    try { p.stdin?.write('q'); p.stdin?.end() } catch { /* */ }
   }
-  await new Promise((r) => setTimeout(r, 1200))
-  stopRing()
-  await new Promise((r) => setTimeout(r, 400))
+  await new Promise((r) => setTimeout(r, 1500))
+  for (const p of ffmpegProcs) {
+    try { if (!p.killed && p.exitCode == null) p.kill('SIGINT') } catch { /* */ }
+  }
+  await new Promise((r) => setTimeout(r, 600))
+  for (const p of ffmpegProcs) {
+    try { if (!p.killed && p.exitCode == null) p.kill('SIGKILL') } catch { /* */ }
+  }
   ffmpegProcs = []
 
   const files = []
@@ -1212,7 +1254,6 @@ async function handleStop() {
     console.log(`[sidecar] REC STOP ${ch} ${path.basename(mp4File)} ${fs.statSync(mp4File).size}B ${dur}ms`)
   }
   recording = null
-  startRing()
   return {
     ok: true,
     sessionId: snap.sessionId,
@@ -1591,6 +1632,7 @@ const server = http.createServer(async (req, res) => {
       if (ext === 'mjpeg' || ext === 'mjpg' || url.searchParams.get('stream') === '1') {
         return attachLive(ch, req, res, url.searchParams.get('raw') === '1')
       }
+      ensureLiveHub(ch)
       const jpeg = readPreviewJpeg(ch)
       if (jpeg) {
         res.writeHead(200, {
