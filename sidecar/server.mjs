@@ -261,8 +261,6 @@ function previewFile(ch) {
 }
 const previewCache = Object.create(null)
 function readPreviewJpeg(ch) {
-  const hub = liveHubs[ch]
-  if (hub && hub.lastJpeg && hub.lastJpeg.length > 800) return hub.lastJpeg
   const f = previewFile(ch)
   try {
     const buf = fs.readFileSync(f)
@@ -275,7 +273,10 @@ function readPreviewJpeg(ch) {
       return buf
     }
   } catch { /* ffmpeg rewriting the file */ }
-  return previewCache[ch] || null
+  if (previewCache[ch]) return previewCache[ch]
+  const hub = liveHubs[ch]
+  if (hub && hub.lastJpeg && hub.lastJpeg.length > 800) return hub.lastJpeg
+  return null
 }
 
 
@@ -479,16 +480,14 @@ function inputArgs(ch) {
     return { args: ['-rtsp_transport', 'tcp', '-i', url], fromUrl: url, kind }
   }
   if (kind === 'mjpeg') {
-    ensureLiveHub(ch)
     return {
       args: [
-        '-f', 'mjpeg',
         '-reconnect', '1',
         '-reconnect_streamed', '1',
         '-reconnect_delay_max', '4',
         '-fflags', '+genpts+discardcorrupt',
         '-use_wallclock_as_timestamps', '1',
-        '-i', `http://127.0.0.1:${PORT}/live/${ch}.mjpeg?raw=1`,
+        '-i', url,
       ],
       fromUrl: url,
       kind,
@@ -543,9 +542,6 @@ function stopRing() {
 
 async function refreshAndRing({ scan = false } = {}) {
   await resolveChannelUrls({ scan })
-  for (const ch of CHANNELS) {
-    if (ch !== 'WIDE') ensureLiveHub(ch)
-  }
   const ready = CHANNELS.filter((ch) => ch !== 'WIDE' && liveUrl(ch) && !stillMdns(liveUrl(ch)))
   if (!ready.length) {
     console.warn('[sidecar] camera IP not found yet — ring idle. Keep HMI open (ARP) or set IP in config.json')
@@ -571,7 +567,7 @@ function wipeRing() {
   if (n) console.log(`[sidecar] wiped ${n} stale ring mp4 (drop leftover testsrc)`)
 }
 
-function startRing() {
+function startRing(recTsMap) {
   refreshFfmpeg()
   const enc = pickEncoder('h264') || pickEncoder('h265')
   if (!ffmpegInfo.ok || !enc) {
@@ -579,6 +575,7 @@ function startRing() {
     ringHot = false
     return
   }
+  const recMap = recTsMap || {}
   for (const ch of CHANNELS) {
     const dir = ringDir(ch)
     ensureDir(dir)
@@ -603,10 +600,17 @@ function startRing() {
     const gop = RING_SEG * geometry(ch).fps
     const br = Math.round((config.bitratesKbps?.[ch] ?? 3000) * 0.5)
     const prev = ffPath(previewFile(ch))
+    const recOut = recMap[ch]
+    const recVf = recOut
+      ? `drawtext${fontOpt()}:text='%{localtime}':x=24:y=18:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.65:boxborderw=8,drawbox=x=(iw-2)/2:y=ih/2-48:w=2:h=96:color=white@0.85:t=fill,drawbox=x=iw/2-48:y=(ih-2)/2:w=96:h=2:color=white@0.85:t=fill,drawbox=x=iw/2-56:y=ih/2-56:w=112:h=112:color=0x3FB950@0.9:t=2`
+      : ''
+    const fc = recOut
+      ? `[0:v]split=3[vring][vt][vr];[vt]fps=8,scale=1280:-2:flags=fast_bilinear[vprev];[vr]${recVf}[vrec]`
+      : '[0:v]split=2[vring][vt];[vt]fps=8,scale=1280:-2:flags=fast_bilinear[vprev]'
     const args = [
       '-y', '-hide_banner', '-loglevel', 'warning',
       ...inArgs,
-      '-filter_complex', '[0:v]split=2[vring][vt];[vt]fps=8,scale=1280:-2:flags=fast_bilinear[vprev]',
+      '-filter_complex', fc,
       '-map', '[vring]', '-an',
       ...videoEncodeArgs({ enc: 'libx264', codecName: 'h264', hw: false }, br, gop),
       '-f', 'segment',
@@ -621,10 +625,21 @@ function startRing() {
       '-update', '1',
       prev,
     ]
-    console.log(`[sidecar] ring+preview ${ch} ← ${fromUrl || kind}`)
+    if (recOut) {
+      const gopR = geometry(ch).fps
+      const brR = recMap._br && recMap._br[ch] ? recMap._br[ch] : (config.bitratesKbps?.[ch] ?? 3000)
+      args.push(
+        '-map', '[vrec]', '-an',
+        ...videoEncodeArgs({ enc: 'libx264', codecName: 'h264', hw: false }, brR, gopR),
+        '-f', 'mpegts',
+        ffPath(recOut),
+      )
+    }
+    console.log(`[sidecar] ring+preview${recOut ? '+REC' : ''} ${ch} ← ${fromUrl || kind}`)
     console.log(`[sidecar]   ring ${dir}`)
     console.log(`[sidecar]   jpeg ${prev}`)
-    ringProcs[ch] = spawnLogged(ffmpegBin, args, `ring:${ch}`)
+    if (recOut) console.log(`[sidecar]   rec  ${recOut}`)
+    ringProcs[ch] = spawnLogged(ffmpegBin, args, recOut ? `ringrec:${ch}` : `ring:${ch}`)
   }
   const fitted = CHANNELS.filter((c) => ringProcs[c])
   ringHot = fitted.length > 0 && fitted.every((ch) => ringProcs[ch] && !ringProcs[ch].killed)
@@ -1011,6 +1026,9 @@ function sessionRecRefs(id) {
 }
 
 function recProcsAlive() {
+  if (recording && recording.recViaRing) {
+    return recording.channels.some((ch) => ringProcs[ch] && ringProcs[ch].exitCode == null && !ringProcs[ch].killed)
+  }
   return ffmpegProcs.some((p) => p && p.exitCode == null && !p.killed)
 }
 
@@ -1035,7 +1053,6 @@ async function handleStart(body) {
     }
   }
   if (!refreshFfmpeg()) return { ok: false, message: 'FFmpeg not available on side-car host. winget install Gyan.FFmpeg' }
-  if (!ringHot) startRing()
 
   const sessionId = String(body.sessionId || `SES-${Date.now()}`)
   let channels = Array.isArray(body.channels) ? body.channels.map(String) : ['LONG', 'IR']
@@ -1063,7 +1080,7 @@ async function handleStart(body) {
   const recTs = {}
 
   for (const ch of channels) {
-    const src = recInputArgs(ch)
+    const src = inputArgs(ch)
     if (!src.args) {
       console.log(`[sidecar] REC ${ch} skipped (no camera)`)
       continue
@@ -1074,33 +1091,7 @@ async function handleStart(body) {
     const mp4File = recMp4Path(sessionId, ch)
     try { if (fs.existsSync(tsFile)) fs.unlinkSync(tsFile) } catch { /* */ }
     try { if (fs.existsSync(mp4File)) fs.unlinkSync(mp4File) } catch { /* */ }
-    const gop = geometry(ch).fps
-    const br = bitrates[ch] || 3000
     writeHudTxt(sessionId, ch, `${ch}  REC`)
-    try {
-      execFileSync(ffmpegBin, [
-        '-y', '-hide_banner', '-loglevel', 'error',
-        '-f', 'lavfi', '-i', `color=c=0x00000000:s=${geometry(ch).w}x${geometry(ch).h}:d=0.04`,
-        '-frames:v', '1',
-        ffPath(hudPngPath(sessionId, ch)),
-      ], { timeout: 8000, windowsHide: true })
-    } catch (e) {
-      console.warn(`[sidecar] HUD blank ${ch}`, e.message || e)
-    }
-    renderHudPng(sessionId, ch, [])
-    const burn = recBurnFilters(sessionId, ch)
-    const args = [
-      '-y', '-hide_banner', '-loglevel', 'warning',
-      ...src.args,
-      '-filter_complex', burn.movie,
-      '-map', '[vout]', '-an',
-      ...videoEncodeArgs(encoder, br, gop),
-      '-f', 'mpegts',
-      ffPath(tsFile),
-    ]
-    console.log(`[sidecar] REC ${ch} ONE FILE +HUD ← ${src.fromUrl || src.kind} → ${tsFile}`)
-    const proc = spawnLogged(ffmpegBin, args, `rec:${ch}`)
-    ffmpegProcs.push(proc)
     recTs[ch] = tsFile
     const ref = makeRecRef(sessionId, ch, mp4File, t0, 0)
     ref.label = `${ch} recording`
@@ -1108,11 +1099,16 @@ async function handleStart(body) {
     refs.push(ref)
   }
 
-  if (!ffmpegProcs.length) return { ok: false, message: 'No camera for REC' }
+  if (!Object.keys(recTs).length) return { ok: false, message: 'No camera for REC' }
+
+  recTs._br = bitrates
+  stopRing()
+  startRing(recTs)
+  if (!ringHot) return { ok: false, message: 'Ring/REC ffmpeg failed to start' }
 
   recording = {
     sessionId,
-    channels: Object.keys(recTs),
+    channels: Object.keys(recTs).filter((k) => k !== '_br'),
     codec: wantCodec,
     actualCodec: 'h264',
     encoder: encoder.enc,
@@ -1121,6 +1117,7 @@ async function handleStart(body) {
     refs,
     recTs,
     copyMode: false,
+    recViaRing: true,
   }
   if (globalThis.__recWatch) clearInterval(globalThis.__recWatch)
   globalThis.__recWatch = setInterval(() => {
@@ -1151,20 +1148,14 @@ async function handleStop() {
   if (globalThis.__recWatch) { clearInterval(globalThis.__recWatch); globalThis.__recWatch = null }
   const snap = recording
   const elapsed = Date.now() - snap.startedAt
-  for (const p of ffmpegProcs) {
-    try {
-      p.stdin?.write('q')
-      p.stdin?.end()
-    } catch { /* */ }
+  // rec is muxed on the same ffmpeg as the ring — stop it to flush rec.ts, then bring live back
+  for (const ch of snap.channels) {
+    const p = ringProcs[ch]
+    try { p?.stdin?.write('q'); p?.stdin?.end() } catch { /* */ }
   }
-  await new Promise((r) => setTimeout(r, 1500))
-  for (const p of ffmpegProcs) {
-    try { if (!p.killed && p.exitCode == null) p.kill('SIGINT') } catch { /* */ }
-  }
-  await new Promise((r) => setTimeout(r, 800))
-  for (const p of ffmpegProcs) {
-    try { if (!p.killed && p.exitCode == null) p.kill('SIGKILL') } catch { /* */ }
-  }
+  await new Promise((r) => setTimeout(r, 1200))
+  stopRing()
+  await new Promise((r) => setTimeout(r, 400))
   ffmpegProcs = []
 
   const files = []
@@ -1188,6 +1179,7 @@ async function handleStop() {
     console.log(`[sidecar] REC STOP ${ch} ${path.basename(mp4File)} ${fs.statSync(mp4File).size}B ${dur}ms`)
   }
   recording = null
+  startRing()
   return {
     ok: true,
     sessionId: snap.sessionId,

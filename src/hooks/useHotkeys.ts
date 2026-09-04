@@ -76,12 +76,16 @@ export function useHotkeys() {
       }
 
       if (key === 'Escape') {
+        // Chrome shows "hold Esc" if the page preventDefault()s Escape in fullscreen.
+        if (document.fullscreenElement || isFullscreen) {
+          exitFullscreen()
+          return
+        }
         e.preventDefault()
         if (showHelp) { setShowHelp(false); return }
         if (showServicePin || showServiceMenu) { closeServiceUi(); return }
         if (showCameraSettings) { setShowCameraSettings(false); return }
         if (screen !== 'COMBAT') { closeOverlays(); return }
-        if (isFullscreen || document.fullscreenElement) { exitFullscreen(); return }
         safe()
         setArmConfirm(false)
         closeOverlays()
