@@ -882,6 +882,80 @@ function recTsPath(sessionId, ch) {
 function recMp4Path(sessionId, ch) {
   return path.join(channelDir(sessionId, ch), 'rec.mp4')
 }
+function findFont() {
+  const list = [
+    'C:/Windows/Fonts/consola.ttf',
+    'C:/Windows/Fonts/consolab.ttf',
+    'C:/Windows/Fonts/arial.ttf',
+    'C:/Windows/Fonts/tahomabd.ttf',
+    '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf',
+    '/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf',
+  ]
+  return list.find((f) => fs.existsSync(f)) || ''
+}
+function fontOpt() {
+  const f = findFont()
+  if (!f) return ''
+  return `:fontfile=${ffPath(f).replace(/:/g, '\\\\:')}`
+}
+function hudPngPath(sessionId, ch) {
+  return path.join(channelDir(sessionId, ch), 'hud.png')
+}
+function hudTxtPath(sessionId, ch) {
+  return path.join(channelDir(sessionId, ch), 'hud.txt')
+}
+function hexColor(c) {
+  const s = String(c || '#3FB950').replace('#', '')
+  return '0x' + s.replace(/[^0-9a-fA-F]/g, '').padEnd(6, '0').slice(0, 6)
+}
+const hudBusy = {}
+function writeHudTxt(sessionId, ch, line) {
+  try { fs.writeFileSync(hudTxtPath(sessionId, ch), String(line || ch).slice(0, 180)) } catch { /* */ }
+}
+function renderHudPng(sessionId, ch, boxes) {
+  const key = `${sessionId}:${ch}`
+  if (hudBusy[key]) return
+  const g = geometry(ch)
+  const png = hudPngPath(sessionId, ch)
+  const vf = ['format=rgba']
+  vf.push(`drawbox=x=${Math.round(g.w / 2 - 1)}:y=${Math.round(g.h / 2 - 52)}:w=2:h=104:color=white@0.9:t=fill`)
+  vf.push(`drawbox=x=${Math.round(g.w / 2 - 52)}:y=${Math.round(g.h / 2 - 1)}:w=104:h=2:color=white@0.9:t=fill`)
+  vf.push(`drawbox=x=${Math.round(g.w / 2 - 64)}:y=${Math.round(g.h / 2 - 64)}:w=128:h=128:color=0x3FB950@0.95:t=3`)
+  for (const b of Array.isArray(boxes) ? boxes.slice(0, 12) : []) {
+    const x = Math.max(0, Math.round(Number(b.x) * g.w))
+    const y = Math.max(0, Math.round(Number(b.y) * g.h))
+    const w = Math.max(4, Math.round(Number(b.w) * g.w))
+    const h = Math.max(4, Math.round(Number(b.h) * g.h))
+    if (x + w > g.w + 40 || y + h > g.h + 40) continue
+    const col = hexColor(b.color)
+    vf.push(`drawbox=x=${x}:y=${y}:w=${w}:h=${h}:color=${col}@0.95:t=${b.dashed ? 2 : 3}`)
+    if (b.label) {
+      const lab = String(b.label).replace(/['\\\\:]/g, ' ').slice(0, 36)
+      vf.push(`drawtext${fontOpt()}:text='${lab}':x=${x + 2}:y=${Math.max(4, y - 26)}:fontsize=22:fontcolor=white:box=1:boxcolor=black@0.65:boxborderw=6`)
+    }
+  }
+  hudBusy[key] = true
+  const args = [
+    '-y', '-hide_banner', '-loglevel', 'error',
+    '-f', 'lavfi', '-i', `color=c=0x00000000:s=${g.w}x${g.h}:d=0.04`,
+    '-vf', vf.join(','),
+    '-frames:v', '1',
+    ffPath(png),
+  ]
+  const proc = spawn(ffmpegBin, args, { stdio: 'ignore' })
+  proc.on('exit', () => { hudBusy[key] = false })
+  proc.on('error', () => { hudBusy[key] = false })
+}
+function recBurnFilters(sessionId, ch) {
+  const txt = ffPath(hudTxtPath(sessionId, ch)).replace(/:/g, '\\\\:')
+  const pngRel = ffPath(path.relative(process.cwd(), hudPngPath(sessionId, ch)) || hudPngPath(sessionId, ch))
+  const time = `drawtext${fontOpt()}:text='%{localtime}':x=24:y=18:fontsize=30:fontcolor=white:box=1:boxcolor=black@0.7:boxborderw=10`
+  const info = `drawtext${fontOpt()}:textfile='${txt}':reload=1:x=24:y=58:fontsize=22:fontcolor=0x7EE787:box=1:boxcolor=black@0.65:boxborderw=8`
+  const vf = `${time},${info}`
+  const movie = `movie='${pngRel}':reload=1,format=rgba[hud];[0:v]${vf}[base];[base][hud]overlay=0:0:eof_action=repeat:repeatlast=1[vout]`
+  return { vf, movie }
+}
+
 function recInputArgs(ch) {
   // Direct camera URL — /live/*.mjpeg is a one-shot JPEG, not a stream (that made 114KB rec.mp4).
   return inputArgs(ch)
@@ -992,15 +1066,29 @@ async function handleStart(body) {
     try { if (fs.existsSync(mp4File)) fs.unlinkSync(mp4File) } catch { /* */ }
     const gop = geometry(ch).fps
     const br = bitrates[ch] || 3000
+    writeHudTxt(sessionId, ch, `${ch}  REC`)
+    try {
+      execFileSync(ffmpegBin, [
+        '-y', '-hide_banner', '-loglevel', 'error',
+        '-f', 'lavfi', '-i', `color=c=0x00000000:s=${geometry(ch).w}x${geometry(ch).h}:d=0.04`,
+        '-frames:v', '1',
+        ffPath(hudPngPath(sessionId, ch)),
+      ], { timeout: 8000, windowsHide: true })
+    } catch (e) {
+      console.warn(`[sidecar] HUD blank ${ch}`, e.message || e)
+    }
+    renderHudPng(sessionId, ch, [])
+    const burn = recBurnFilters(sessionId, ch)
     const args = [
       '-y', '-hide_banner', '-loglevel', 'warning',
       ...src.args,
-      '-map', '0:v:0', '-an',
+      '-filter_complex', burn.movie,
+      '-map', '[vout]', '-an',
       ...videoEncodeArgs(encoder, br, gop),
       '-f', 'mpegts',
       ffPath(tsFile),
     ]
-    console.log(`[sidecar] REC ${ch} ONE FILE ← ${src.fromUrl || src.kind} → ${tsFile}`)
+    console.log(`[sidecar] REC ${ch} ONE FILE +HUD ← ${src.fromUrl || src.kind} → ${tsFile}`)
     const proc = spawnLogged(ffmpegBin, args, `rec:${ch}`)
     ffmpegProcs.push(proc)
     recTs[ch] = tsFile
@@ -1562,6 +1650,18 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req).catch(() => ({}))
       const ok = await refreshAndRing({ scan: Boolean(body && body.scan) })
       return json(res, 200, { ok, ringHot, streams: Object.fromEntries(CHANNELS.map((ch) => [ch, liveUrl(ch) || null])) })
+    }
+    if (method === 'POST' && url.pathname === '/record/hud') {
+      const body = await readBody(req).catch(() => ({}))
+      if (!recording) return json(res, 200, { ok: false, message: 'not recording' })
+      const boxes = Array.isArray(body.boxes) ? body.boxes : []
+      const line = String(body.line || '')
+      for (const ch of recording.channels) {
+        writeHudTxt(recording.sessionId, ch, line || ch)
+        renderHudPng(recording.sessionId, ch, boxes)
+      }
+      recording.hud = { boxes, line, at: Date.now() }
+      return json(res, 200, { ok: true })
     }
     if (method === 'POST' && url.pathname === '/record/start') {
       const result = await handleStart(await readBody(req))

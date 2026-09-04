@@ -14,6 +14,7 @@ import { ArchiveWorkspace } from './components/ArchiveWorkspace'
 import { useHmiStore } from './store/useHmiStore'
 import { useHotkeys } from './hooks/useHotkeys'
 import { useGamepad } from './hooks/useGamepad'
+import { useRecHud } from './hooks/useRecHud'
 import { usePanoptes } from './hooks/usePanoptes'
 import { usePanoptesAi } from './hooks/usePanoptesAi'
 import { resolveMediaRecorder } from './adapters/mediaRecorder'
@@ -41,6 +42,7 @@ export default function App() {
   } = useHmiStore()
   useHotkeys()
   useGamepad()
+  useRecHud()
 
   useEffect(() => {
     const onFs = () => useHmiStore.getState().setFullscreenFlag(!!document.fullscreenElement)
