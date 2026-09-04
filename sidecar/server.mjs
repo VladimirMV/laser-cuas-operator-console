@@ -216,6 +216,12 @@ async function resolveChannelUrls({ scan = false } = {}) {
         console.log(`[sidecar] ${ch} DNS pending ${next}`)
         continue
       }
+      // Pinned numeric IP: do NOT probe (Connection:close after 80B knocks single-client 2k-stream).
+      if (/^https?:\/\/\d+\.\d+\.\d+\.\d+/.test(next)) {
+        chosen = next
+        console.log(`[sidecar] ${ch} pinned ${next}`)
+        break
+      }
       const hit = await probeUrl(next)
       if (hit && hit.score >= 30) {
         chosen = next
@@ -260,20 +266,31 @@ function previewFile(ch) {
   return path.join(previewDir(), ch.toLowerCase() + '.jpg')
 }
 const previewCache = Object.create(null)
-function readPreviewJpeg(ch) {
+function extractJpeg(buf) {
+  if (!buf || buf.length < 800) return null
+  let eoi = -1
+  for (let i = buf.length - 2; i >= 1; i--) {
+    if (buf[i] === 0xff && buf[i + 1] === 0xd9) { eoi = i; break }
+  }
+  if (eoi < 0) return null
+  let soi = -1
+  for (let i = eoi; i >= 1; i--) {
+    if (buf[i] === 0xff && buf[i + 1] === 0xd8) { soi = i; break }
+  }
+  if (soi < 0 || eoi - soi < 800) return null
+  return Buffer.from(buf.slice(soi, eoi + 2))
+}
+function harvestPreview(ch) {
   const f = previewFile(ch)
   try {
     const buf = fs.readFileSync(f)
-    if (
-      buf.length > 800 &&
-      buf[0] === 0xff && buf[1] === 0xd8 &&
-      buf[buf.length - 2] === 0xff && buf[buf.length - 1] === 0xd9
-    ) {
-      previewCache[ch] = buf
-      return buf
-    }
-  } catch { /* ffmpeg rewriting the file */ }
-  if (previewCache[ch]) return previewCache[ch]
+    const jpeg = extractJpeg(buf)
+    if (jpeg) previewCache[ch] = jpeg
+  } catch { /* locked by ffmpeg */ }
+}
+function readPreviewJpeg(ch) {
+  harvestPreview(ch)
+  if (previewCache[ch] && previewCache[ch].length > 800) return previewCache[ch]
   const hub = liveHubs[ch]
   if (hub && hub.lastJpeg && hub.lastJpeg.length > 800) return hub.lastJpeg
   return null
@@ -487,6 +504,8 @@ function inputArgs(ch) {
         '-reconnect_delay_max', '4',
         '-fflags', '+genpts+discardcorrupt',
         '-use_wallclock_as_timestamps', '1',
+        '-analyzeduration', '5000000',
+        '-probesize', '5000000',
         '-i', url,
       ],
       fromUrl: url,
@@ -601,39 +620,38 @@ function startRing(recTsMap) {
     const br = Math.round((config.bitratesKbps?.[ch] ?? 3000) * 0.5)
     const prev = ffPath(previewFile(ch))
     const recOut = recMap[ch]
-    const recVf = recOut
-      ? `drawtext${fontOpt()}:text='%{localtime}':x=24:y=18:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.65:boxborderw=8,drawbox=x=(iw-2)/2:y=ih/2-48:w=2:h=96:color=white@0.85:t=fill,drawbox=x=iw/2-48:y=(ih-2)/2:w=96:h=2:color=white@0.85:t=fill,drawbox=x=iw/2-56:y=ih/2-56:w=112:h=112:color=0x3FB950@0.9:t=2`
-      : ''
-    const fc = recOut
-      ? `[0:v]split=3[vring][vt][vr];[vt]fps=8,scale=1280:-2:flags=fast_bilinear[vprev];[vr]${recVf}[vrec]`
-      : '[0:v]split=2[vring][vt];[vt]fps=8,scale=1280:-2:flags=fast_bilinear[vprev]'
-    const args = [
-      '-y', '-hide_banner', '-loglevel', 'warning',
-      ...inArgs,
-      '-filter_complex', fc,
-      '-map', '[vring]', '-an',
-      ...videoEncodeArgs({ enc: 'libx264', codecName: 'h264', hw: false }, br, gop),
-      '-f', 'segment',
-      '-segment_time', String(RING_SEG),
-      '-segment_wrap', String(RING_WRAP),
-      '-reset_timestamps', '1',
-      '-segment_format', 'mpegts',
-      pattern,
-      '-map', '[vprev]', '-an',
-      '-q:v', '5',
-      '-f', 'image2',
-      '-update', '1',
-      prev,
-    ]
-    if (recOut) {
+    let args
+    if (!recOut) {
+      // Live view only — one output, no libx264. 1080p split+encode was killing LONG preview.
+      args = [
+        '-y', '-hide_banner', '-loglevel', 'warning',
+        ...inArgs,
+        '-an',
+        '-vf', 'fps=6,scale=1280:-2:flags=fast_bilinear',
+        '-q:v', '5',
+        '-f', 'image2',
+        '-update', '1',
+        prev,
+      ]
+    } else {
+      const recVf = `drawtext${fontOpt()}:text='%{localtime}':x=24:y=18:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.65:boxborderw=8,drawbox=x=(iw-2)/2:y=ih/2-48:w=2:h=96:color=white@0.85:t=fill,drawbox=x=iw/2-48:y=(ih-2)/2:w=96:h=2:color=white@0.85:t=fill,drawbox=x=iw/2-56:y=ih/2-56:w=112:h=112:color=0x3FB950@0.9:t=2`
+      const fc = `[0:v]split=2[vt][vr];[vt]fps=6,scale=1280:-2:flags=fast_bilinear[vprev];[vr]${recVf}[vrec]`
       const gopR = geometry(ch).fps
       const brR = recMap._br && recMap._br[ch] ? recMap._br[ch] : (config.bitratesKbps?.[ch] ?? 3000)
-      args.push(
+      args = [
+        '-y', '-hide_banner', '-loglevel', 'warning',
+        ...inArgs,
+        '-filter_complex', fc,
+        '-map', '[vprev]', '-an',
+        '-q:v', '5',
+        '-f', 'image2',
+        '-update', '1',
+        prev,
         '-map', '[vrec]', '-an',
         ...videoEncodeArgs({ enc: 'libx264', codecName: 'h264', hw: false }, brR, gopR),
         '-f', 'mpegts',
         ffPath(recOut),
-      )
+      ]
     }
     console.log(`[sidecar] ring+preview${recOut ? '+REC' : ''} ${ch} ← ${fromUrl || kind}`)
     console.log(`[sidecar]   ring ${dir}`)
@@ -644,8 +662,16 @@ function startRing(recTsMap) {
   const fitted = CHANNELS.filter((c) => ringProcs[c])
   ringHot = fitted.length > 0 && fitted.every((ch) => ringProcs[ch] && !ringProcs[ch].killed)
   for (const ch of fitted) {
-    ringProcs[ch]?.on('exit', () => {
+    ringProcs[ch]?.on('exit', (code, signal) => {
       ringHot = fitted.every((c) => ringProcs[c] && ringProcs[c].exitCode == null && !ringProcs[c].killed)
+      if (signal === 'SIGKILL') return
+      console.warn(`[sidecar] grab ${ch} died code=${code} signal=${signal} — restart in 1.2s`)
+      if (globalThis.__grabRestart) clearTimeout(globalThis.__grabRestart)
+      globalThis.__grabRestart = setTimeout(() => {
+        stopRing()
+        if (recording && recording.recViaRing) startRing(recording.recTs)
+        else startRing()
+      }, 1200)
     })
   }
 }
