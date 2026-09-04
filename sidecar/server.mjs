@@ -878,27 +878,85 @@ function diskBytes() {
   return n
 }
 
+function recTsPath(sessionId, ch) {
+  return path.join(channelDir(sessionId, ch), 'rec.ts')
+}
+function recMp4Path(sessionId, ch) {
+  return path.join(channelDir(sessionId, ch), 'rec.mp4')
+}
+function recInputArgs(ch) {
+  ensureLiveHub(ch)
+  const src = inputArgs(ch)
+  if (src.kind === 'mjpeg' && src.args) {
+    return {
+      args: [
+        '-f', 'mjpeg',
+        '-reconnect', '1',
+        '-reconnect_streamed', '1',
+        '-reconnect_delay_max', '4',
+        '-fflags', '+genpts+discardcorrupt',
+        '-use_wallclock_as_timestamps', '1',
+        '-i', `http://127.0.0.1:${PORT}/live/${ch}.mjpeg`,
+      ],
+      fromUrl: src.fromUrl,
+      kind: src.kind,
+    }
+  }
+  return src
+}
+function probeDurationMs(file) {
+  try {
+    const probe = String(ffmpegBin).replace(/ffmpeg(\.exe)?$/i, (_m, e) => 'ffprobe' + (e || ''))
+    const out = execFileSync(probe, ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', file], {
+      encoding: 'utf8', timeout: 8000, windowsHide: true,
+    })
+    const sec = parseFloat(String(out).trim())
+    if (Number.isFinite(sec) && sec > 0) return Math.round(sec * 1000)
+  } catch { /* */ }
+  return 0
+}
+function makeRecRef(sessionId, ch, file, t0, durationMs) {
+  const rel = path.relative(MEDIA_ROOT, file).replace(/\\/g, '/')
+  const st = fs.existsSync(file) ? fs.statSync(file) : { size: 0 }
+  return {
+    id: `MED-rec-${sessionId}-${ch}`,
+    ts_utc: new Date(t0).toISOString(),
+    t_mono_ms: 0,
+    session_id: sessionId,
+    channel: ch,
+    kind: 'SEGMENT',
+    label: `${ch} session`,
+    codec: 'h264',
+    container: 'mp4',
+    duration_ms: durationMs || 0,
+    path: rel,
+    url: '/media/' + rel,
+    bytes: st.size,
+  }
+}
+function sessionRecRefs(id) {
+  const refs = []
+  for (const ch of ['LONG', 'IR', 'WIDE']) {
+    const mp4 = recMp4Path(id, ch)
+    if (!fs.existsSync(mp4) || fs.statSync(mp4).size < 4096) continue
+    refs.push(makeRecRef(id, ch, mp4, fs.statSync(mp4).mtimeMs, probeDurationMs(mp4)))
+  }
+  return refs
+}
+
 async function handleStart(body) {
   if (recording) {
-    const want = String(body.sessionId || recording.sessionId)
-    const chs = recording.channels || ['LONG', 'IR']
-    const extra = [
-      ...harvestRing(want, chs),
-      ...cloneLiveIntoSession(want, chs),
-    ]
-    recording.sessionId = want
-    recording.refs = [...(recording.refs || []), ...extra]
-    console.log(`[sidecar] REC already → hydrate ${want} +${extra.length} files`)
+    console.log(`[sidecar] REC already ${recording.sessionId}`)
     return {
       ok: true,
       already: true,
-      sessionId: want,
-      channels: chs,
+      sessionId: recording.sessionId,
+      channels: recording.channels,
       codec_target: recording.codec,
       codec_actual: recording.actualCodec,
       encoder: recording.encoder,
       mediaRoot: MEDIA_ROOT,
-      refs: recording.refs,
+      refs: recording.refs || [],
     }
   }
   if (!refreshFfmpeg()) return { ok: false, message: 'FFmpeg not available on side-car host. winget install Gyan.FFmpeg' }
@@ -908,17 +966,14 @@ async function handleStart(body) {
   let channels = Array.isArray(body.channels) ? body.channels.map(String) : ['LONG', 'IR']
   channels = channels.filter((c) => c !== 'WIDE' && CHANNELS.includes(c))
   if (!channels.length) channels = ['LONG', 'IR']
-  if (!channels.length) return { ok: false, message: 'No valid channels' }
 
   const wantCodec = 'h264'
   const encoder = pickEncoder('h264') || pickEncoder('h265')
-  if (!encoder && !ringHot) return { ok: false, message: 'No suitable video encoder' }
+  if (!encoder) return { ok: false, message: 'No suitable video encoder' }
 
-  const segmentDurationSec = Number(body.segmentDurationSec || config.segmentDurationSec || 15)
-  const prerollSec = Number(body.prerollSec || DEFAULT_PREROLL)
   const bitrates = {
-    LONG: config.bitratesKbps?.LONG ?? 6000,
-    WIDE: config.bitratesKbps?.WIDE ?? 3000,
+    LONG: config.bitratesKbps?.LONG ?? 4000,
+    WIDE: config.bitratesKbps?.WIDE ?? 2500,
     IR: config.bitratesKbps?.IR ?? 2000,
     ...(body.bitrates || {}),
   }
@@ -927,113 +982,65 @@ async function handleStart(body) {
   ensureDir(path.join(sessionDir(sessionId), 'media', 'snapshots'))
   ensureDir(path.join(sessionDir(sessionId), 'media', 'clips'))
 
-  const prerollRefs = copyPreroll(sessionId, channels, prerollSec)
-
   ffmpegProcs = []
-  const refs = [...prerollRefs]
+  const refs = []
   const t0 = Date.now()
-
-  if (ringHot) {
-    refs.push(...harvestRing(sessionId, channels))
-    refs.push(...cloneLiveIntoSession(sessionId, channels))
-    if (globalThis.__recHarvest) clearInterval(globalThis.__recHarvest)
-    globalThis.__recHarvest = setInterval(() => {
-      try {
-        const more = [
-          ...harvestRing(sessionId, channels),
-          ...cloneLiveIntoSession(sessionId, channels),
-        ]
-        if (recording && more.length) recording.refs.push(...more)
-      } catch { /* */ }
-    }, RING_SEG * 1000)
-    recording = {
-      sessionId, channels, codec: wantCodec, actualCodec: 'h264', encoder: 'ring-copy',
-      startedAt: t0, segmentDurationSec, prerollSec, bitrates, refs, copyMode: true,
-    }
-    console.log(`[sidecar] REC ${sessionId} from ring → ${sessionDir(sessionId)}`)
-    return {
-      ok: true, sessionId, channels, codec_target: wantCodec, codec_actual: 'h264',
-      encoder: 'ring-copy', mediaRoot: MEDIA_ROOT, prerollCopied: prerollRefs.length, refs,
-    }
-  }
+  const recTs = {}
 
   for (const ch of channels) {
-    const br = bitrates[ch] || 3000
-    const outDir = channelDir(sessionId, ch)
-    ensureDir(outDir)
-    const outFile = ffPath(path.join(outDir, `rec_live_${encoder.codecName}.mp4`))
-    ensureLiveHub(ch)
-    const src = inputArgs(ch)
-    const localLive = `http://127.0.0.1:${PORT}/live/${ch}.mjpeg`
-    const fromUrl = src.fromUrl
-    const kind = src.kind
-    const inArgs = (src.kind === 'mjpeg' && src.args)
-      ? [
-          '-f', 'mjpeg',
-          '-reconnect', '1',
-          '-reconnect_streamed', '1',
-          '-reconnect_delay_max', '4',
-          '-fflags', '+genpts+discardcorrupt',
-          '-use_wallclock_as_timestamps', '1',
-          '-i', localLive,
-        ]
-      : src.args
-    if (!inArgs) {
-      console.log(`[sidecar] REC ${ch} skipped (not fitted)`)
+    const src = recInputArgs(ch)
+    if (!src.args) {
+      console.log(`[sidecar] REC ${ch} skipped (no camera)`)
       continue
     }
-    const gop = Math.max(geometry(ch).fps, 2 * geometry(ch).fps)
+    const destDir = channelDir(sessionId, ch)
+    ensureDir(destDir)
+    const tsFile = recTsPath(sessionId, ch)
+    const mp4File = recMp4Path(sessionId, ch)
+    try { if (fs.existsSync(tsFile)) fs.unlinkSync(tsFile) } catch { /* */ }
+    try { if (fs.existsSync(mp4File)) fs.unlinkSync(mp4File) } catch { /* */ }
+    const gop = geometry(ch).fps
+    const br = bitrates[ch] || 3000
     const args = [
       '-y', '-hide_banner', '-loglevel', 'warning',
-      ...inArgs,
+      ...src.args,
       '-map', '0:v:0', '-an',
       ...videoEncodeArgs(encoder, br, gop),
-      '-f', 'mp4',
-      '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-      outFile,
+      '-f', 'mpegts',
+      ffPath(tsFile),
     ]
-    console.log(`[sidecar] REC ${ch} ← ${fromUrl || kind} → ${outDir} (${encoder.enc} ${br}k)`)
-    ffmpegProcs.push(spawnLogged(ffmpegBin, args, ch))
-    const ref = {
-      id: `MED-open-${ch}-${t0}`,
-      ts_utc: new Date(t0).toISOString(),
-      t_mono_ms: 0,
-      session_id: sessionId,
-      channel: ch,
-      kind: 'SEGMENT',
-      label: `SEG ${ch} open · ${encoder.codecName}`,
-      codec: encoder.codecName,
-      container: 'mp4',
-      bitrate_kbps: br,
-      hw_encoder: encoder.hw,
-      path: path.relative(MEDIA_ROOT, outDir).replace(/\\/g, '/'),
-    }
+    console.log(`[sidecar] REC ${ch} ONE FILE ← ${src.fromUrl || src.kind} → ${tsFile}`)
+    ffmpegProcs.push(spawnLogged(ffmpegBin, args, `rec:${ch}`))
+    recTs[ch] = tsFile
+    const ref = makeRecRef(sessionId, ch, mp4File, t0, 0)
+    ref.label = `${ch} recording`
+    delete ref.url
     refs.push(ref)
-    appendIndex(sessionId, ref)
   }
+
+  if (!ffmpegProcs.length) return { ok: false, message: 'No camera for REC' }
 
   recording = {
     sessionId,
-    channels,
+    channels: Object.keys(recTs),
     codec: wantCodec,
-    actualCodec: encoder.codecName,
+    actualCodec: 'h264',
     encoder: encoder.enc,
     startedAt: t0,
-    segmentDurationSec,
-    prerollSec,
     bitrates,
     refs,
+    recTs,
+    copyMode: false,
   }
-
+  console.log(`[sidecar] REC START ${sessionId} channels=${recording.channels.join('+')} one-file mpegts`)
   return {
     ok: true,
     sessionId,
-    channels,
+    channels: recording.channels,
     codec_target: wantCodec,
-    codec_actual: encoder.codecName,
+    codec_actual: 'h264',
     encoder: encoder.enc,
     mediaRoot: MEDIA_ROOT,
-    prerollCopied: prerollRefs.length,
     refs,
   }
 }
@@ -1042,15 +1049,18 @@ async function handleStop() {
   if (!recording) return { ok: false, message: 'Not recording', refs: [] }
   if (globalThis.__recHarvest) { clearInterval(globalThis.__recHarvest); globalThis.__recHarvest = null }
   const snap = recording
-  if (!snap.copyMode) {
-    for (const p of ffmpegProcs) {
-      try {
-        p.stdin?.write('q')
-        p.stdin?.end()
-      } catch { /* */ }
-    }
-    await new Promise((r) => setTimeout(r, 2500))
+  const elapsed = Date.now() - snap.startedAt
+  for (const p of ffmpegProcs) {
+    try {
+      p.stdin?.write('q')
+      p.stdin?.end()
+    } catch { /* */ }
   }
+  await new Promise((r) => setTimeout(r, 1500))
+  for (const p of ffmpegProcs) {
+    try { if (!p.killed && p.exitCode == null) p.kill('SIGINT') } catch { /* */ }
+  }
+  await new Promise((r) => setTimeout(r, 800))
   for (const p of ffmpegProcs) {
     try { if (!p.killed && p.exitCode == null) p.kill('SIGKILL') } catch { /* */ }
   }
@@ -1058,30 +1068,30 @@ async function handleStop() {
 
   const files = []
   for (const ch of snap.channels) {
-    for (const seg of renameSegmentsWithMono(snap.sessionId, ch, snap.actualCodec, snap.segmentDurationSec)) {
-      const ref = {
-        id: `MED-seg-${ch}-${path.basename(seg.file)}`,
-        ts_utc: new Date().toISOString(),
-        t_mono_ms: seg.t_mono_ms ?? Date.now() - snap.startedAt,
-        session_id: snap.sessionId,
-        channel: ch,
-        kind: 'SEGMENT',
-        label: seg.file,
-        codec: snap.actualCodec,
-        container: 'mp4',
-        path: seg.rel,
-        url: `/media/${seg.rel}`,
-      }
-      files.push(ref)
-      appendIndex(snap.sessionId, ref)
+    const tsFile = (snap.recTs && snap.recTs[ch]) || recTsPath(snap.sessionId, ch)
+    const mp4File = recMp4Path(snap.sessionId, ch)
+    if (!fs.existsSync(tsFile) || fs.statSync(tsFile).size < 4096) {
+      console.warn(`[sidecar] REC stop ${ch} no ts (${tsFile})`)
+      continue
     }
+    const ok = remuxCopy(tsFile, mp4File)
+    if (!ok) {
+      console.warn(`[sidecar] REC remux fail ${ch}, keeping ts`)
+      continue
+    }
+    try { fs.unlinkSync(tsFile) } catch { /* */ }
+    const dur = probeDurationMs(mp4File) || elapsed
+    const ref = makeRecRef(snap.sessionId, ch, mp4File, snap.startedAt, dur)
+    files.push(ref)
+    appendIndex(snap.sessionId, ref)
+    console.log(`[sidecar] REC STOP ${ch} ${path.basename(mp4File)} ${fs.statSync(mp4File).size}B ${dur}ms`)
   }
   recording = null
   return {
     ok: true,
     sessionId: snap.sessionId,
     refs: files,
-    durationMs: Date.now() - snap.startedAt,
+    durationMs: elapsed,
     mediaRoot: MEDIA_ROOT,
   }
 }
@@ -1495,14 +1505,8 @@ const server = http.createServer(async (req, res) => {
     }
     if (method === 'GET' && url.pathname.startsWith('/sessions/') && url.pathname.endsWith('/index')) {
       const id = decodeURIComponent(url.pathname.slice('/sessions/'.length, -'/index'.length))
-      if (id && id !== 'LIVE' && id !== 'RING') {
-        try {
-          harvestRing(id, ['LONG', 'IR'])
-          cloneLiveIntoSession(id, ['LONG', 'IR'])
-        } catch (e) {
-          console.warn('[sidecar] hydrate', e.message || e)
-        }
-      }
+      const recs = sessionRecRefs(id)
+      if (recs.length) return json(res, 200, { ok: true, sessionId: id, refs: recs })
       const idx = path.join(sessionDir(id), 'media_index.jsonl')
       const refs = []
       const seen = new Set()
@@ -1511,39 +1515,43 @@ const server = http.createServer(async (req, res) => {
           if (!line.trim()) continue
           try {
             const row = JSON.parse(line)
-            refs.push(row)
-            if (row.url) seen.add(row.url)
+            if (row.url && /\/rec\.mp4$/i.test(row.url)) {
+              refs.push(row)
+              seen.add(row.url)
+            }
           } catch { /* */ }
         }
       }
-      for (const ch of ['LONG', 'IR']) {
-        const dir = channelDir(id, ch)
-        if (!fs.existsSync(dir)) continue
-        const files = fs.readdirSync(dir).filter((f) => f.toLowerCase().endsWith('.mp4')).sort()
-        files.forEach((f, i) => {
-          const fp = path.join(dir, f)
-          let st
-          try { st = fs.statSync(fp) } catch { return }
-          if (st.size < 4096) return
-          const rel = path.relative(MEDIA_ROOT, fp).replace(/\\/g, '/')
-          const url = '/media/' + rel
-          if (seen.has(url)) return
-          seen.add(url)
-          refs.push({
-            id: `MED-disk-${id}-${ch}-${f}`,
-            ts_utc: new Date(st.mtimeMs).toISOString(),
-            t_mono_ms: i * RING_SEG * 1000,
-            session_id: id,
-            channel: ch,
-            kind: 'SEGMENT',
-            label: `${ch} ${f}`,
-            codec: 'h264',
-            container: 'mp4',
-            duration_ms: RING_SEG * 1000,
-            path: rel,
-            url,
+      if (id === 'LIVE' || id === 'RING') {
+        for (const ch of ['LONG', 'IR']) {
+          const dir = channelDir(id, ch)
+          if (!fs.existsSync(dir)) continue
+          const files = fs.readdirSync(dir).filter((f) => f.toLowerCase().endsWith('.mp4')).sort()
+          files.forEach((f, i) => {
+            const fp = path.join(dir, f)
+            let st
+            try { st = fs.statSync(fp) } catch { return }
+            if (st.size < 4096) return
+            const rel = path.relative(MEDIA_ROOT, fp).replace(/\\/g, '/')
+            const url = '/media/' + rel
+            if (seen.has(url)) return
+            seen.add(url)
+            refs.push({
+              id: `MED-disk-${id}-${ch}-${f}`,
+              ts_utc: new Date(st.mtimeMs).toISOString(),
+              t_mono_ms: i * RING_SEG * 1000,
+              session_id: id,
+              channel: ch,
+              kind: 'SEGMENT',
+              label: `${ch} ${f}`,
+              codec: 'h264',
+              container: 'mp4',
+              duration_ms: RING_SEG * 1000,
+              path: rel,
+              url,
+            })
           })
-        })
+        }
       }
       return json(res, 200, { ok: true, sessionId: id, refs })
     }

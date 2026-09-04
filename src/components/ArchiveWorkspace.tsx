@@ -12,7 +12,7 @@ import { cn } from '../lib/utils'
 import type { ArchiveEvent, MediaRef, SessionBundle } from '../types/archive'
 import type { CameraChannel } from '../types/hmi'
 import { archiveMock } from '../adapters/archive'
-import { DEFAULT_SIDECAR_URL } from '../adapters/mediaRecorder'
+import { DEFAULT_SIDECAR_URL, HttpMediaRecorder } from '../adapters/mediaRecorder'
 import { ReplayCanvas } from './ReplayCanvas'
 import { eventColor, eventMarker, fmtClock, hudFromBundle } from '../lib/replayHud'
 
@@ -23,6 +23,8 @@ function segmentFor(bundle: SessionBundle, channel: CameraChannel, t: number): M
     .filter((m) => m.channel === channel && (m.kind === 'SEGMENT' || m.kind === 'CLIP') && m.url)
     .sort((a, b) => a.t_mono_ms - b.t_mono_ms)
   if (!segs.length) return null
+  const rec = segs.find((s) => /rec\.mp4(\?|$)/i.test(s.url || '') || /session/i.test(s.label || ''))
+  if (rec) return rec
   let cur = segs[0]
   for (const s of segs) {
     if (s.t_mono_ms <= t) cur = s
@@ -41,41 +43,51 @@ function ReplayFeed({
   className?: string
 }) {
   const vid = useRef<HTMLVideoElement>(null)
+  const [ready, setReady] = useState(false)
   const [broken, setBroken] = useState(false)
   const seg = hud ? segmentFor(bundle, channel, playhead) : null
   const url = seg?.url
-  const liveBuf = bundle.session.id === 'LIVE' || bundle.session.id === 'RING'
-  const fallback = `${DEFAULT_SIDECAR_URL}/media/latest/${channel}.mp4`
-  const src = url && !broken ? url : (liveBuf ? fallback : url || fallback)
-  useEffect(() => { setBroken(false) }, [url])
+  useEffect(() => {
+    setReady(false)
+    setBroken(false)
+  }, [url])
   useEffect(() => {
     const el = vid.current
     if (!el || !url || !seg) return
-    const off = (playhead - seg.t_mono_ms) / 1000
-    if (Math.abs(el.currentTime - off) > 0.35) {
+    const durMs = seg.duration_ms && seg.duration_ms > 0 ? seg.duration_ms : (el.duration || 0) * 1000
+    const off = durMs > 0 ? Math.min(playhead, durMs - 80) / 1000 : playhead / 1000
+    if (Math.abs(el.currentTime - off) > 0.4) {
       try { el.currentTime = Math.max(0, off) } catch { /* */ }
     }
   }, [playhead, url, seg])
   useEffect(() => {
     const el = vid.current
-    if (!el || !src) return
+    if (!el || !url) return
     const play = () => { void el.play().catch(() => undefined) }
     el.addEventListener('loadeddata', play)
     play()
     return () => el.removeEventListener('loadeddata', play)
-  }, [src])
+  }, [url])
   return (
     <div className={className}>
-      <video
+      {url && (
+        <video
           ref={vid}
-          src={src}
+          src={url}
           muted
           playsInline
-          autoPlay
-          onError={() => { if (!broken && url) setBroken(true) }}
+          preload="auto"
+          onLoadedData={() => { setReady(true); setBroken(false) }}
+          onError={() => setBroken(true)}
           className="absolute inset-0 h-full w-full object-cover bg-black"
         />
-      <ReplayCanvas channel={channel} hud={hud!} t={playhead} hasVideo className="absolute inset-0 h-full w-full pointer-events-none" />
+      )}
+      <ReplayCanvas channel={channel} hud={hud!} t={playhead} hasVideo={ready && !broken} className="absolute inset-0 h-full w-full pointer-events-none" />
+      {(!url || broken) && (
+        <div className="absolute bottom-3 left-3 z-10 font-mono text-[10px] tracking-widest text-[#F85149] bg-black/70 px-2 py-1">
+          {broken ? 'VIDEO NOT PLAYABLE' : 'NO VIDEO — REC then Stop, wait remux, Оновити'}
+        </div>
+      )}
     </div>
   )
 }
@@ -104,16 +116,25 @@ export function ArchiveWorkspace() {
   const refresh = () => setSessions(listArchiveSessions())
   useEffect(() => {
     refresh()
-    const list = listArchiveSessions()
-    const live = list.find((s) => s.id === 'LIVE')
-    const ring = list.find((s) => s.id === 'RING')
-    if (live && sidecarConnected) setSelectedId('LIVE')
-    else if (ring && sidecarConnected) setSelectedId('RING')
   }, [sidecarConnected, ringHot])
+  useEffect(() => {
+    if (!selectedId || selectedId === 'LIVE' || selectedId === 'RING') return
+    void HttpMediaRecorder.fetchSessionIndex(selectedId).then((refs) => {
+      if (!refs.length) return
+      archiveMock.replaceSessionMedia(selectedId, refs)
+      refresh()
+    })
+  }, [selectedId])
   const bundle: SessionBundle | null = useMemo(
     () => (selectedId ? getArchiveBundle(selectedId) : null),
     [selectedId, sessions, getArchiveBundle]
   )
+  useEffect(() => {
+    if (!selectedId) return
+    const b = getArchiveBundle(selectedId)
+    const rs = b?.events.find((e) => e.type === 'REC_START')
+    setPlayhead(rs?.t_mono_ms ?? 0)
+  }, [selectedId, getArchiveBundle])
   const liveMode = !selectedId
   const maxMono = bundle
     ? Math.max(

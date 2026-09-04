@@ -34,37 +34,9 @@ export function ReplayCanvas({ channel, hud, t, className, hasVideo }: Props) {
 
     if (hasVideo) {
       ctx.clearRect(0, 0, w, h)
-    } else if (ir) {
-      const g = ctx.createLinearGradient(0, 0, 0, h)
-      g.addColorStop(0, '#04060a')
-      g.addColorStop(0.55, '#0b1520')
-      g.addColorStop(1, '#1a3a38')
-      ctx.fillStyle = g
-      ctx.fillRect(0, 0, w, h)
-      ctx.fillStyle = 'rgba(40, 90, 80, 0.18)'
-      ctx.fillRect(0, h * 0.62, w, h * 0.38)
     } else {
-      const g = ctx.createLinearGradient(0, 0, 0, h)
-      g.addColorStop(0, '#6a849c')
-      g.addColorStop(0.45, '#8ea3b0')
-      g.addColorStop(0.7, '#b7a48a')
-      g.addColorStop(1, '#3a4036')
-      ctx.fillStyle = g
+      ctx.fillStyle = '#0d1117'
       ctx.fillRect(0, 0, w, h)
-      ctx.fillStyle = 'rgba(255,210,140,0.18)'
-      ctx.beginPath()
-      ctx.arc(w * 0.78, h * 0.22, 48, 0, Math.PI * 2)
-      ctx.fill()
-      ctx.fillStyle = '#2c332c'
-      ctx.beginPath()
-      ctx.moveTo(0, h * 0.72)
-      ctx.lineTo(w * 0.18, h * 0.64)
-      ctx.lineTo(w * 0.4, h * 0.7)
-      ctx.lineTo(w * 0.62, h * 0.6)
-      ctx.lineTo(w, h * 0.62)
-      ctx.lineTo(w, h)
-      ctx.lineTo(0, h)
-      ctx.fill()
     }
 
     const present = hud.track === 'TRACKING' || hud.track === 'COAST'
