@@ -23,21 +23,25 @@ function sidecarSnapUrl(url: string): string | null {
 
 function JpegPoll({
   url,
+  fallbackUrl,
   className,
   thermalStyle,
   zoom,
 }: {
   url: string
+  fallbackUrl?: string | null
   className?: string
   thermalStyle?: boolean
   zoom: number
 }) {
   const [src, setSrc] = useState<string | null>(null)
+  const [direct, setDirect] = useState(false)
   const z = Math.max(1, zoom || 1)
 
   useEffect(() => {
     let stop = false
     let obj: string | null = null
+    let fails = 0
     const tick = async () => {
       if (stop) return
       try {
@@ -45,27 +49,40 @@ function JpegPoll({
         if (r.ok) {
           const blob = await r.blob()
           if (blob.size >= 256) {
+            fails = 0
+            setDirect(false)
             const next = URL.createObjectURL(blob)
             if (obj) URL.revokeObjectURL(obj)
             obj = next
             setSrc(next)
-          }
+          } else fails++
+        } else {
+          fails++
+          if (fails >= 6 && fallbackUrl) setDirect(true)
         }
       } catch {
-        /* sidecar not ready yet — keep polling */
+        fails++
+        if (fails >= 6 && fallbackUrl) setDirect(true)
       }
-      if (!stop) window.setTimeout(tick, 120)
+      if (!stop) window.setTimeout(tick, direct ? 2000 : 150)
     }
     void tick()
     return () => {
       stop = true
       if (obj) URL.revokeObjectURL(obj)
     }
-  }, [url])
+  }, [url, fallbackUrl])
 
   return (
     <div className={cn('absolute inset-0 bg-black', className)}>
-      {src ? (
+      {direct && fallbackUrl ? (
+        <img
+          src={fallbackUrl}
+          alt=""
+          className={cn('absolute inset-0 w-full h-full object-cover', thermalStyle && 'contrast-125')}
+          style={{ transform: `scale(${z})`, transformOrigin: 'center center' }}
+        />
+      ) : src ? (
         <img
           src={src}
           alt=""
@@ -130,7 +147,7 @@ export function StreamPlayer({
   }
 
   if (snap) {
-    return <JpegPoll url={snap} className={className} thermalStyle={thermalStyle} zoom={z} />
+    return <JpegPoll url={snap} fallbackUrl={fallbackUrl} className={className} thermalStyle={thermalStyle} zoom={z} />
   }
 
   return (

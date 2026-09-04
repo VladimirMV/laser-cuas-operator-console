@@ -551,12 +551,27 @@ function spawnLogged(bin, args, tag) {
 const ringProcs = {}
 let ringHot = false
 
+function stopGrab(ch) {
+  try { ringProcs[ch]?.kill('SIGKILL') } catch { /* */ }
+  delete ringProcs[ch]
+}
 function stopRing() {
-  for (const ch of CHANNELS) {
-    try { ringProcs[ch]?.kill('SIGKILL') } catch { /* */ }
-    delete ringProcs[ch]
-  }
+  for (const ch of CHANNELS) stopGrab(ch)
   ringHot = false
+}
+const grabBackoff = {}
+const urlTry = {}
+function channelUrlChoices(ch) {
+  const cfg = config.channels?.[ch] || {}
+  const list = [
+    liveUrl(ch),
+    (cfg.url || '').trim(),
+    (cfg.fallback || '').trim(),
+  ]
+  if (ch === 'LONG') {
+    list.push('http://192.168.80.238/2k-stream', 'http://192.168.80.243/2k-stream', 'http://panoptes.local/2k-stream')
+  }
+  return list.filter((u, i, a) => u && u !== 'testsrc' && !stillMdns(u) && a.indexOf(u) === i)
 }
 
 async function refreshAndRing({ scan = false } = {}) {
@@ -566,10 +581,8 @@ async function refreshAndRing({ scan = false } = {}) {
     console.warn('[sidecar] camera IP not found yet — ring idle. Keep HMI open (ARP) or set IP in config.json')
     return false
   }
-  const already = ready.every((ch) => ringProcs[ch] && ringProcs[ch].exitCode == null)
-  if (already && ringHot) return true
-  stopRing()
-  startRing()
+  for (const ch of ready) startGrab(ch, recording && recording.recTs ? recording.recTs[ch] : null)
+  ringHot = ready.some((ch) => ringProcs[ch] && ringProcs[ch].exitCode == null)
   return ringHot
 }
 
@@ -586,94 +599,88 @@ function wipeRing() {
   if (n) console.log(`[sidecar] wiped ${n} stale ring mp4 (drop leftover testsrc)`)
 }
 
-function startRing(recTsMap) {
+function startGrab(ch, recOut) {
+  if (ch === 'WIDE') return
   refreshFfmpeg()
-  const enc = pickEncoder('h264') || pickEncoder('h265')
-  if (!ffmpegInfo.ok || !enc) {
-    console.warn('[sidecar] ring not started — FFmpeg encoder missing (see ffmpeg miss lines above)')
-    ringHot = false
+  if (!ffmpegInfo.ok) return
+  const alive = ringProcs[ch] && ringProcs[ch].exitCode == null && !ringProcs[ch].killed
+  if (alive) return
+  ensureDir(previewDir())
+  ensureDir(ringDir(ch))
+  const choices = channelUrlChoices(ch)
+  if (!choices.length) {
+    console.log(`[sidecar] grab ${ch} skipped (no URL)`)
     return
   }
+  const idx = (urlTry[ch] || 0) % choices.length
+  const url = choices[idx]
+  resolvedUrls[ch] = url
+  const src = inputArgs(ch)
+  if (!src.args || src.kind === 'testsrc') {
+    console.log(`[sidecar] grab ${ch} skipped (${src.kind})`)
+    return
+  }
+  const prev = ffPath(previewFile(ch))
+  const vf = ch === 'IR' ? 'fps=8' : 'fps=5,scale=1280:-2:flags=fast_bilinear'
+  let args
+  if (!recOut) {
+    args = [
+      '-y', '-hide_banner', '-loglevel', 'warning',
+      ...src.args,
+      '-an', '-sn',
+      '-vf', vf,
+      '-c:v', 'mjpeg', '-q:v', '5',
+      '-f', 'image2',
+      '-update', '1',
+      prev,
+    ]
+  } else {
+    const recVf = `drawtext${fontOpt()}:text='%{localtime}':x=24:y=18:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.65:boxborderw=8,drawbox=x=(iw-2)/2:y=ih/2-48:w=2:h=96:color=white@0.85:t=fill,drawbox=x=iw/2-48:y=(ih-2)/2:w=96:h=2:color=white@0.85:t=fill,drawbox=x=iw/2-56:y=ih/2-56:w=112:h=112:color=0x3FB950@0.9:t=2`
+    const fc = `[0:v]split=2[vt][vr];[vt]${vf}[vprev];[vr]${recVf}[vrec]`
+    const gopR = geometry(ch).fps
+    const brR = (recording && recording.bitrates && recording.bitrates[ch]) || (config.bitratesKbps?.[ch] ?? 3000)
+    args = [
+      '-y', '-hide_banner', '-loglevel', 'warning',
+      ...src.args,
+      '-filter_complex', fc,
+      '-map', '[vprev]', '-an',
+      '-c:v:0', 'mjpeg', '-q:v:0', '5',
+      '-f', 'image2',
+      '-update', '1',
+      prev,
+      '-map', '[vrec]', '-an',
+      ...videoEncodeArgs({ enc: 'libx264', codecName: 'h264', hw: false }, brR, gopR),
+      '-f', 'mpegts',
+      ffPath(recOut),
+    ]
+  }
+  console.log(`[sidecar] grab ${ch}${recOut ? '+REC' : ''} ← ${url}`)
+  const proc = spawnLogged(ffmpegBin, args, `grab:${ch}`)
+  ringProcs[ch] = proc
+  proc.on('exit', (code, signal) => {
+    if (ringProcs[ch] === proc) delete ringProcs[ch]
+    ringHot = CHANNELS.some((c) => ringProcs[c] && ringProcs[c].exitCode == null)
+    if (signal === 'SIGKILL') return
+    urlTry[ch] = (urlTry[ch] || 0) + 1
+    const wait = Math.min(8000, 1200 + (grabBackoff[ch] || 0))
+    grabBackoff[ch] = wait
+    console.warn(`[sidecar] grab ${ch} died code=${code} — retry ${choices[(urlTry[ch]) % choices.length]} in ${wait}ms`)
+    setTimeout(() => {
+      grabBackoff[ch] = 0
+      const rec = recording && recording.recTs ? recording.recTs[ch] : null
+      startGrab(ch, rec)
+    }, wait)
+  })
+}
+
+function startRing(recTsMap) {
   const recMap = recTsMap || {}
   for (const ch of CHANNELS) {
-    const dir = ringDir(ch)
-    ensureDir(dir)
-    const pattern = ffPath(path.join(dir, 'r_%02d.ts'))
-    ensureDir(previewDir())
-    const src = inputArgs(ch)
-    const fromUrl = src.fromUrl
-    const kind = src.kind
-    const inArgs = src.args
-    if (!inArgs) {
-      console.log(`[sidecar] ring ${ch} skipped (not fitted)`)
-      continue
-    }
-    if (fromUrl && stillMdns(fromUrl)) {
-      console.log(`[sidecar] ring ${ch} waiting for IP (${fromUrl})`)
-      continue
-    }
-    if (kind === 'testsrc' && !FORCE_TESTSRC) {
-      console.log(`[sidecar] ring ${ch} refused testsrc`)
-      continue
-    }
-    const gop = RING_SEG * geometry(ch).fps
-    const br = Math.round((config.bitratesKbps?.[ch] ?? 3000) * 0.5)
-    const prev = ffPath(previewFile(ch))
-    const recOut = recMap[ch]
-    let args
-    if (!recOut) {
-      // Live view only — one output, no libx264. 1080p split+encode was killing LONG preview.
-      args = [
-        '-y', '-hide_banner', '-loglevel', 'warning',
-        ...inArgs,
-        '-an',
-        '-vf', 'fps=6,scale=1280:-2:flags=fast_bilinear',
-        '-q:v', '5',
-        '-f', 'image2',
-        '-update', '1',
-        prev,
-      ]
-    } else {
-      const recVf = `drawtext${fontOpt()}:text='%{localtime}':x=24:y=18:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.65:boxborderw=8,drawbox=x=(iw-2)/2:y=ih/2-48:w=2:h=96:color=white@0.85:t=fill,drawbox=x=iw/2-48:y=(ih-2)/2:w=96:h=2:color=white@0.85:t=fill,drawbox=x=iw/2-56:y=ih/2-56:w=112:h=112:color=0x3FB950@0.9:t=2`
-      const fc = `[0:v]split=2[vt][vr];[vt]fps=6,scale=1280:-2:flags=fast_bilinear[vprev];[vr]${recVf}[vrec]`
-      const gopR = geometry(ch).fps
-      const brR = recMap._br && recMap._br[ch] ? recMap._br[ch] : (config.bitratesKbps?.[ch] ?? 3000)
-      args = [
-        '-y', '-hide_banner', '-loglevel', 'warning',
-        ...inArgs,
-        '-filter_complex', fc,
-        '-map', '[vprev]', '-an',
-        '-q:v', '5',
-        '-f', 'image2',
-        '-update', '1',
-        prev,
-        '-map', '[vrec]', '-an',
-        ...videoEncodeArgs({ enc: 'libx264', codecName: 'h264', hw: false }, brR, gopR),
-        '-f', 'mpegts',
-        ffPath(recOut),
-      ]
-    }
-    console.log(`[sidecar] ring+preview${recOut ? '+REC' : ''} ${ch} ← ${fromUrl || kind}`)
-    console.log(`[sidecar]   ring ${dir}`)
-    console.log(`[sidecar]   jpeg ${prev}`)
-    if (recOut) console.log(`[sidecar]   rec  ${recOut}`)
-    ringProcs[ch] = spawnLogged(ffmpegBin, args, recOut ? `ringrec:${ch}` : `ring:${ch}`)
+    if (ch === 'WIDE') continue
+    stopGrab(ch)
+    startGrab(ch, recMap[ch] || null)
   }
-  const fitted = CHANNELS.filter((c) => ringProcs[c])
-  ringHot = fitted.length > 0 && fitted.every((ch) => ringProcs[ch] && !ringProcs[ch].killed)
-  for (const ch of fitted) {
-    ringProcs[ch]?.on('exit', (code, signal) => {
-      ringHot = fitted.every((c) => ringProcs[c] && ringProcs[c].exitCode == null && !ringProcs[c].killed)
-      if (signal === 'SIGKILL') return
-      console.warn(`[sidecar] grab ${ch} died code=${code} signal=${signal} — restart in 1.2s`)
-      if (globalThis.__grabRestart) clearTimeout(globalThis.__grabRestart)
-      globalThis.__grabRestart = setTimeout(() => {
-        stopRing()
-        if (recording && recording.recViaRing) startRing(recording.recTs)
-        else startRing()
-      }, 1200)
-    })
-  }
+  ringHot = CHANNELS.some((c) => ringProcs[c] && ringProcs[c].exitCode == null)
 }
 
 function listRingFiles(ch) {
