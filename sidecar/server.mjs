@@ -368,17 +368,17 @@ function writeRecFrame(ch, jpeg) {
   if (!rec || !rec.sinks || !rec.sinks[ch] || !jpeg) return
   const s = rec.sinks[ch]
   try {
-    const t = Date.now() - rec.startedAt
+    const tms = Date.now() - rec.startedAt
     const off = s.bytes
-    s.stream.write(jpeg)
+    if (s.fd != null) fs.writeSync(s.fd, jpeg)
+    else s.stream.write(jpeg)
     s.bytes += jpeg.length
     s.n++
-    if (s.burn && s.burn.stdin && s.burn.stdin.writable) {
-      try { s.burn.stdin.write(jpeg) } catch { /* */ }
-    }
-    s.index.write(JSON.stringify({ t, off, len: jpeg.length }) + '\n')
-    if (s.n === 1 || s.n % 40 === 0) {
-      console.log(`[sidecar] REC ${ch} jpeg #${s.n} ${s.bytes}B t=${t}ms`)
+    const line = JSON.stringify({ t: tms, off, len: jpeg.length }) + '\n'
+    if (s.ifd != null) fs.writeSync(s.ifd, line)
+    else s.index.write(line)
+    if (s.n === 1 || s.n % 20 === 0) {
+      console.log(`[sidecar] REC ${ch} jpeg #${s.n} ${s.bytes}B t=${tms}ms`)
     }
   } catch (e) {
     console.warn(`[sidecar] REC write ${ch} ${e.message}`)
@@ -784,7 +784,7 @@ function remuxCopy(from, to) {
   return false
 }
 
-function remuxCopyMjpeg(from, to, fps, sessionId, ch) {
+function remuxCopyMjpeg(from, to, fps, sessionId, ch, startedAt) {
   ensureDir(path.dirname(to))
   const rate = String(Math.min(15, Math.max(2, fps || 8)))
   const common = ['-y', '-hide_banner', '-loglevel', 'error', '-f', 'mjpeg', '-framerate', rate, '-i', from]
@@ -798,11 +798,22 @@ function remuxCopyMjpeg(from, to, fps, sessionId, ch) {
       return false
     }
   }
-  const alreadyHud = /hud\.mjpg$/i.test(from)
-  if (!alreadyHud && sessionId && ch) {
-    const { movie } = recBurnFilters(sessionId, ch)
-    if (tryRun([...common, '-filter_complex', movie, '-map', '[vout]', ...enc])) return true
+  const g = geometry(ch || 'LONG')
+  const fsSz = ch === 'IR' ? 16 : 28
+  const epoch = Math.floor((startedAt || Date.now()) / 1000)
+  const yTime = g.h - 16 - fsSz
+  const time = `drawtext${fontOpt()}:text='%{pts\\:gmtime\\:${epoch}\\:%Y-%m-%d %H\\:%M\\:%S}':x=24:y=${yTime}:fontsize=${fsSz}:fontcolor=white:box=1:boxcolor=black@0.7:boxborderw=8`
+  const reticle = `drawbox=x=${Math.round(g.w / 2 - 1)}:y=${Math.round(g.h / 2 - 48)}:w=2:h=96:color=white@0.9:t=fill,drawbox=x=${Math.round(g.w / 2 - 48)}:y=${Math.round(g.h / 2 - 1)}:w=96:h=2:color=white@0.9:t=fill,drawbox=x=${Math.round(g.w / 2 - 56)}:y=${Math.round(g.h / 2 - 56)}:w=112:h=112:color=0x3FB950@0.9:t=2`
+  const vf = `${time},${reticle}`
+  const png = sessionId && ch ? hudPngPath(sessionId, ch) : ''
+  if (png && fs.existsSync(png) && fs.statSync(png).size > 100) {
+    if (tryRun([
+      ...common, '-i', png,
+      '-filter_complex', `[0:v]${vf}[base];[1:v]format=rgba[hud];[hud][base]scale2ref[hs][b];[b][hs]overlay=0:0[vout]`,
+      '-map', '[vout]', ...enc,
+    ])) return true
   }
+  if (tryRun([...common, '-vf', vf, ...enc])) return true
   if (tryRun([...common, ...enc])) return true
   console.warn(`[sidecar] remux mjpeg fail ${from}`)
   return false
@@ -1261,37 +1272,13 @@ async function handleStart(body) {
     writeHudTxt(sessionId, ch, `${ch}  REC`)
     renderHudPng(sessionId, ch, [])
     sinks[ch] = {
-      stream: fs.createWriteStream(mjpg),
-      index: fs.createWriteStream(idx),
+      fd: fs.openSync(mjpg, 'w'),
+      ifd: fs.openSync(idx, 'w'),
+      stream: null,
+      index: null,
       bytes: 0,
       n: 0,
       file: mjpg,
-      burn: null,
-      burnFile: path.join(destDir, 'rec.hud.mjpg'),
-    }
-    if (ffmpegInfo.ok) {
-      try {
-        const hp = hudPngPath(sessionId, ch)
-        if (!fs.existsSync(hp)) {
-          execFileSync(ffmpegBin, [
-            '-y', '-hide_banner', '-loglevel', 'error',
-            '-f', 'lavfi', '-i', `color=c=0x00000000:s=${geometry(ch).size}:d=0.04`,
-            '-frames:v', '1', ffPath(hp),
-          ], { timeout: 8000, windowsHide: true })
-        }
-      } catch { /* */ }
-      const { movie } = recBurnFilters(sessionId, ch)
-      sinks[ch].burn = spawnLogged(ffmpegBin, [
-        '-y', '-hide_banner', '-loglevel', 'warning',
-        '-f', 'mjpeg', '-framerate', '8', '-i', 'pipe:0',
-        '-filter_complex', movie,
-        '-map', '[vout]',
-        '-c:v', 'mjpeg', '-q:v', '5',
-        '-f', 'mjpeg',
-        ffPath(sinks[ch].burnFile),
-      ], `burn:${ch}`)
-      ffmpegProcs.push(sinks[ch].burn)
-      console.log(`[sidecar] REC ${ch} HUD burn on`)
     }
     const hub = liveHubs[ch]
     console.log(`[sidecar] REC ${ch} jpeg-dump → ${mjpg} hub=${hub && hub.n || 0} frames`)
@@ -1365,21 +1352,23 @@ async function handleStop() {
 
   if (snap.sinks) {
     for (const ch of Object.keys(snap.sinks)) {
-      try { snap.sinks[ch].stream.end() } catch { /* */ }
-      try { snap.sinks[ch].index.end() } catch { /* */ }
+      const s = snap.sinks[ch]
+      try { if (s.fd != null) fs.closeSync(s.fd) } catch { /* */ }
+      try { if (s.ifd != null) fs.closeSync(s.ifd) } catch { /* */ }
+      s.fd = null
+      s.ifd = null
+      try { s.stream && s.stream.end() } catch { /* */ }
+      try { s.index && s.index.end() } catch { /* */ }
     }
-    await new Promise((r) => setTimeout(r, 400))
+    await new Promise((r) => setTimeout(r, 200))
   }
 
   const files = []
   for (const ch of snap.channels) {
     const sink = snap.sinks && snap.sinks[ch]
-    if (sink && sink.burn) {
-      try { sink.burn.stdin.end() } catch { /* */ }
-    }
-    const mjpgRaw = recMjpgPath(snap.sessionId, ch)
-    const mjpgHud = sink && sink.burnFile
-    const mjpg = (mjpgHud && fs.existsSync(mjpgHud) && fs.statSync(mjpgHud).size > 800) ? mjpgHud : mjpgRaw
+    if (sink && sink.fd != null) { try { fs.closeSync(sink.fd) } catch { /* */ } sink.fd = null }
+    if (sink && sink.ifd != null) { try { fs.closeSync(sink.ifd) } catch { /* */ } sink.ifd = null }
+    const mjpg = recMjpgPath(snap.sessionId, ch)
     const mp4File = recMp4Path(snap.sessionId, ch)
     const n = sink ? sink.n : 0
     const bytes = fs.existsSync(mjpg) ? fs.statSync(mjpg).size : 0
@@ -1390,7 +1379,7 @@ async function handleStop() {
     let used = mjpg
     if (refreshFfmpeg()) {
       const fps = Math.max(1, Math.round((n || 1) / Math.max(1, elapsed / 1000)))
-      const ok = remuxCopyMjpeg(mjpg, mp4File, fps, snap.sessionId, ch)
+      const ok = remuxCopyMjpeg(mjpg, mp4File, fps, snap.sessionId, ch, snap.startedAt)
       if (ok) used = mp4File
       else console.warn(`[sidecar] REC remux skip ${ch}, keep rec.mjpg ${bytes}B`)
     }
