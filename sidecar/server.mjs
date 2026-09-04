@@ -286,14 +286,14 @@ function harvestPreview(ch) {
     const buf = fs.readFileSync(f)
     const jpeg = extractJpeg(buf)
     if (jpeg) previewCache[ch] = jpeg
+    else if (buf.length > 10000 && buf[0] === 0xff && buf[1] === 0xd8) previewCache[ch] = buf
   } catch { /* locked by ffmpeg */ }
 }
 function readPreviewJpeg(ch) {
-  const hub = liveHubs[ch]
-  if (hub && hub.lastJpeg && hub.lastJpeg.length > 800) return hub.lastJpeg
-  if (previewCache[ch] && previewCache[ch].length > 800) return previewCache[ch]
   harvestPreview(ch)
-  if (previewCache[ch] && previewCache[ch].length > 800) return previewCache[ch]
+  if (previewCache[ch] && previewCache[ch].length > 400) return previewCache[ch]
+  const hub = liveHubs[ch]
+  if (hub && hub.lastJpeg && hub.lastJpeg.length > 400) return hub.lastJpeg
   return null
 }
 
@@ -615,7 +615,10 @@ function channelUrlChoices(ch) {
   if (ch === 'LONG') {
     list.push('http://192.168.80.238/2k-stream', 'http://192.168.80.243/2k-stream', 'http://panoptes.local/2k-stream')
   }
-  return list.filter((u, i, a) => u && u !== 'testsrc' && !stillMdns(u) && a.indexOf(u) === i)
+  const uniq = list.filter((u, i, a) => u && u !== 'testsrc' && a.indexOf(u) === i)
+  const ip = uniq.filter((u) => !stillMdns(u))
+  const mdns = uniq.filter((u) => stillMdns(u))
+  return ip.length ? ip : mdns
 }
 
 async function refreshAndRing({ scan = false } = {}) {
@@ -625,8 +628,11 @@ async function refreshAndRing({ scan = false } = {}) {
     console.warn('[sidecar] camera IP not found yet — ring idle. Keep HMI open (ARP) or set IP in config.json')
     return false
   }
-  for (const ch of ready) ensureLiveHub(ch)
-  ringHot = ready.some((ch) => liveHubs[ch] && !liveHubs[ch].dead)
+  for (const ch of ready) {
+    try { stopLiveHub(ch) } catch { /* */ }
+    startGrab(ch, null)
+  }
+  ringHot = ready.some((ch) => ringProcs[ch] && ringProcs[ch].exitCode == null)
   return ringHot
 }
 
@@ -665,7 +671,7 @@ function startGrab(ch, recOut) {
     return
   }
   const prev = ffPath(previewFile(ch))
-  const vf = ch === 'IR' ? 'fps=8' : 'fps=5,scale=1280:-2:flags=fast_bilinear'
+  const vf = 'fps=6'
   let args
   if (!recOut) {
     args = [
@@ -673,7 +679,7 @@ function startGrab(ch, recOut) {
       ...src.args,
       '-an', '-sn',
       '-vf', vf,
-      '-c:v', 'mjpeg', '-q:v', '5',
+      '-q:v', '6',
       '-f', 'image2',
       '-update', '1',
       prev,
@@ -1221,7 +1227,7 @@ async function handleStart(body) {
   const sinks = {}
 
   for (const ch of channels) {
-    ensureLiveHub(ch)
+    startGrab(ch, null)
     const destDir = channelDir(sessionId, ch)
     ensureDir(destDir)
     const mjpg = recMjpgPath(sessionId, ch)
@@ -1716,7 +1722,8 @@ const server = http.createServer(async (req, res) => {
       if (ext === 'mjpeg' || ext === 'mjpg' || url.searchParams.get('stream') === '1') {
         return attachLive(ch, req, res, url.searchParams.get('raw') === '1')
       }
-      ensureLiveHub(ch)
+      startGrab(ch, null)
+      harvestPreview(ch)
       const jpeg = readPreviewJpeg(ch)
       if (jpeg) {
         res.writeHead(200, {
@@ -1933,8 +1940,13 @@ server.listen(PORT, HOST, () => {
     console.log(`[sidecar] ringHot=${ringHot} started=${ok}`)
   })
   setInterval(() => {
-    if (!ringHot && !FORCE_TESTSRC) {
-      void refreshAndRing({ scan: false })
+    for (const ch of ['LONG', 'IR']) {
+      harvestPreview(ch)
+      startGrab(ch, null)
+      if (recording && previewCache[ch]) writeRecFrame(ch, previewCache[ch])
     }
+  }, 180)
+  setInterval(() => {
+    if (!FORCE_TESTSRC) void refreshAndRing({ scan: false })
   }, 8000)
 })
