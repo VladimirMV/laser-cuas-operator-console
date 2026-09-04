@@ -87,7 +87,7 @@ export function useRecHud() {
       }).catch(() => undefined)
     }
     tick()
-    const id = setInterval(tick, 120)
+    const id = setInterval(tick, 400)
     return () => {
       dead = true
       clearInterval(id)

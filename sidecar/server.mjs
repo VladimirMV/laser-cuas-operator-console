@@ -261,6 +261,8 @@ function previewFile(ch) {
 }
 const previewCache = Object.create(null)
 function readPreviewJpeg(ch) {
+  const hub = liveHubs[ch]
+  if (hub && hub.lastJpeg && hub.lastJpeg.length > 800) return hub.lastJpeg
   const f = previewFile(ch)
   try {
     const buf = fs.readFileSync(f)
@@ -273,8 +275,7 @@ function readPreviewJpeg(ch) {
       return buf
     }
   } catch { /* ffmpeg rewriting the file */ }
-  if (previewCache[ch]) return previewCache[ch]
-  return liveHubs[ch] && liveHubs[ch].lastJpeg ? liveHubs[ch].lastJpeg : null
+  return previewCache[ch] || null
 }
 
 
@@ -478,14 +479,16 @@ function inputArgs(ch) {
     return { args: ['-rtsp_transport', 'tcp', '-i', url], fromUrl: url, kind }
   }
   if (kind === 'mjpeg') {
+    ensureLiveHub(ch)
     return {
       args: [
+        '-f', 'mjpeg',
         '-reconnect', '1',
         '-reconnect_streamed', '1',
         '-reconnect_delay_max', '4',
         '-fflags', '+genpts+discardcorrupt',
         '-use_wallclock_as_timestamps', '1',
-        '-i', url,
+        '-i', `http://127.0.0.1:${PORT}/live/${ch}.mjpeg?raw=1`,
       ],
       fromUrl: url,
       kind,
@@ -540,6 +543,9 @@ function stopRing() {
 
 async function refreshAndRing({ scan = false } = {}) {
   await resolveChannelUrls({ scan })
+  for (const ch of CHANNELS) {
+    if (ch !== 'WIDE') ensureLiveHub(ch)
+  }
   const ready = CHANNELS.filter((ch) => ch !== 'WIDE' && liveUrl(ch) && !stillMdns(liveUrl(ch)))
   if (!ready.length) {
     console.warn('[sidecar] camera IP not found yet — ring idle. Keep HMI open (ARP) or set IP in config.json')
@@ -912,9 +918,13 @@ const hudBusy = {}
 function writeHudTxt(sessionId, ch, line) {
   try { fs.writeFileSync(hudTxtPath(sessionId, ch), String(line || ch).slice(0, 180)) } catch { /* */ }
 }
+const hudLast = {}
 function renderHudPng(sessionId, ch, boxes) {
   const key = `${sessionId}:${ch}`
   if (hudBusy[key]) return
+  const now = Date.now()
+  if (hudLast[key] && now - hudLast[key] < 400) return
+  hudLast[key] = now
   const g = geometry(ch)
   const png = hudPngPath(sessionId, ch)
   const vf = ['format=rgba']
@@ -957,7 +967,7 @@ function recBurnFilters(sessionId, ch) {
 }
 
 function recInputArgs(ch) {
-  // Direct camera URL — /live/*.mjpeg is a one-shot JPEG, not a stream (that made 114KB rec.mp4).
+  // Same hub as the ring — one TCP to the camera, ffmpeg reads local MJPEG fan-out.
   return inputArgs(ch)
 }
 function probeDurationMs(file) {
@@ -1548,9 +1558,13 @@ const server = http.createServer(async (req, res) => {
     if (method === 'GET' && url.pathname.startsWith('/live/')) {
       const rest = url.pathname.slice('/live/'.length)
       const ch = rest.split('.')[0].toUpperCase()
+      const ext = (rest.split('.')[1] || '').toLowerCase()
       if (!CHANNELS.includes(ch) || ch === 'WIDE') {
         res.writeHead(404, CORS)
         return res.end('no such channel')
+      }
+      if (ext === 'mjpeg' || ext === 'mjpg' || url.searchParams.get('stream') === '1') {
+        return attachLive(ch, req, res, url.searchParams.get('raw') === '1')
       }
       const jpeg = readPreviewJpeg(ch)
       if (jpeg) {
@@ -1563,7 +1577,7 @@ const server = http.createServer(async (req, res) => {
         return res.end(jpeg)
       }
       res.writeHead(503, { ...CORS, 'Retry-After': '1' })
-      return res.end('no frame yet — wait for ffmpeg preview')
+      return res.end('no frame yet — camera hub warming up')
     }
     if (method === 'GET' && url.pathname === '/caps') return json(res, 200, getCaps())
     if (method === 'GET' && url.pathname === '/status') {
