@@ -549,7 +549,6 @@ async function refreshAndRing({ scan = false } = {}) {
   if (already && ringHot) return true
   stopRing()
   startRing()
-  if (ringHot) startLiveHarvest()
   return ringHot
 }
 
@@ -623,7 +622,6 @@ function startRing() {
   }
   const fitted = CHANNELS.filter((c) => ringProcs[c])
   ringHot = fitted.length > 0 && fitted.every((ch) => ringProcs[ch] && !ringProcs[ch].killed)
-  if (ringHot) startLiveHarvest()
   for (const ch of fitted) {
     ringProcs[ch]?.on('exit', () => {
       ringHot = fitted.every((c) => ringProcs[c] && ringProcs[c].exitCode == null && !ringProcs[c].killed)
@@ -885,24 +883,8 @@ function recMp4Path(sessionId, ch) {
   return path.join(channelDir(sessionId, ch), 'rec.mp4')
 }
 function recInputArgs(ch) {
-  ensureLiveHub(ch)
-  const src = inputArgs(ch)
-  if (src.kind === 'mjpeg' && src.args) {
-    return {
-      args: [
-        '-f', 'mjpeg',
-        '-reconnect', '1',
-        '-reconnect_streamed', '1',
-        '-reconnect_delay_max', '4',
-        '-fflags', '+genpts+discardcorrupt',
-        '-use_wallclock_as_timestamps', '1',
-        '-i', `http://127.0.0.1:${PORT}/live/${ch}.mjpeg`,
-      ],
-      fromUrl: src.fromUrl,
-      kind: src.kind,
-    }
-  }
-  return src
+  // Direct camera URL — /live/*.mjpeg is a one-shot JPEG, not a stream (that made 114KB rec.mp4).
+  return inputArgs(ch)
 }
 function probeDurationMs(file) {
   try {
@@ -944,7 +926,16 @@ function sessionRecRefs(id) {
   return refs
 }
 
+function recProcsAlive() {
+  return ffmpegProcs.some((p) => p && p.exitCode == null && !p.killed)
+}
+
 async function handleStart(body) {
+  if (recording && !recProcsAlive()) {
+    console.warn('[sidecar] REC processes dead — restart')
+    recording = null
+    ffmpegProcs = []
+  }
   if (recording) {
     console.log(`[sidecar] REC already ${recording.sessionId}`)
     return {
@@ -1010,7 +1001,8 @@ async function handleStart(body) {
       ffPath(tsFile),
     ]
     console.log(`[sidecar] REC ${ch} ONE FILE ← ${src.fromUrl || src.kind} → ${tsFile}`)
-    ffmpegProcs.push(spawnLogged(ffmpegBin, args, `rec:${ch}`))
+    const proc = spawnLogged(ffmpegBin, args, `rec:${ch}`)
+    ffmpegProcs.push(proc)
     recTs[ch] = tsFile
     const ref = makeRecRef(sessionId, ch, mp4File, t0, 0)
     ref.label = `${ch} recording`
@@ -1032,7 +1024,17 @@ async function handleStart(body) {
     recTs,
     copyMode: false,
   }
-  console.log(`[sidecar] REC START ${sessionId} channels=${recording.channels.join('+')} one-file mpegts`)
+  if (globalThis.__recWatch) clearInterval(globalThis.__recWatch)
+  globalThis.__recWatch = setInterval(() => {
+    if (!recording) return
+    for (const ch of recording.channels) {
+      const f = recTsPath(recording.sessionId, ch)
+      let sz = 0
+      try { sz = fs.existsSync(f) ? fs.statSync(f).size : 0 } catch { sz = 0 }
+      console.log(`[sidecar] REC ${ch} rec.ts ${sz}B`)
+    }
+  }, 5000)
+  console.log(`[sidecar] REC START ${sessionId} channels=${recording.channels.join('+')} one-file mpegts ← camera`)
   return {
     ok: true,
     sessionId,
@@ -1048,6 +1050,7 @@ async function handleStart(body) {
 async function handleStop() {
   if (!recording) return { ok: false, message: 'Not recording', refs: [] }
   if (globalThis.__recHarvest) { clearInterval(globalThis.__recHarvest); globalThis.__recHarvest = null }
+  if (globalThis.__recWatch) { clearInterval(globalThis.__recWatch); globalThis.__recWatch = null }
   const snap = recording
   const elapsed = Date.now() - snap.startedAt
   for (const p of ffmpegProcs) {

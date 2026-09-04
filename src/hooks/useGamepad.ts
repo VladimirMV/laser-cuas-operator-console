@@ -158,7 +158,9 @@ export function useGamepad() {
         else store.exitFullscreen()
       }
 
-      if (store.screen !== 'COMBAT') {
+      const blockSlew =
+        store.screen === 'CALIBRATION' || store.screen === 'BITE' || store.screen === 'MAINTENANCE'
+      if (blockSlew) {
         if (wasSlewing.current) {
           wasSlewing.current = false
           store.stopTurretSlew()
